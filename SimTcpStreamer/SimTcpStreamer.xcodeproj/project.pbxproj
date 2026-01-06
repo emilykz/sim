@@ -1,0 +1,548 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXContainerItemProxy section */
+		D4F59AB82EBD137F0041E5FC /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = D4F59AA12EBD137B0041E5FC /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = D4F59AA82EBD137B0041E5FC;
+			remoteInfo = SimTcpStreamer;
+		};
+		D4F59AC22EBD137F0041E5FC /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = D4F59AA12EBD137B0041E5FC /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = D4F59AA82EBD137B0041E5FC;
+			remoteInfo = SimTcpStreamer;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		D4F59AA92EBD137B0041E5FC /* SimTcpStreamer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SimTcpStreamer.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		D4F59AB72EBD137F0041E5FC /* SimTcpStreamerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SimTcpStreamerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		D4F59AC12EBD137F0041E5FC /* SimTcpStreamerUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SimTcpStreamerUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		D4F59AAB2EBD137B0041E5FC /* SimTcpStreamer */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = SimTcpStreamer;
+			sourceTree = "<group>";
+		};
+		D4F59ABA2EBD137F0041E5FC /* SimTcpStreamerTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = SimTcpStreamerTests;
+			sourceTree = "<group>";
+		};
+		D4F59AC42EBD137F0041E5FC /* SimTcpStreamerUITests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = SimTcpStreamerUITests;
+			sourceTree = "<group>";
+		};
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		D4F59AA62EBD137B0041E5FC /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D4F59AB42EBD137F0041E5FC /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D4F59ABE2EBD137F0041E5FC /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		D4F59AA02EBD137B0041E5FC = {
+			isa = PBXGroup;
+			children = (
+				D4F59AAB2EBD137B0041E5FC /* SimTcpStreamer */,
+				D4F59ABA2EBD137F0041E5FC /* SimTcpStreamerTests */,
+				D4F59AC42EBD137F0041E5FC /* SimTcpStreamerUITests */,
+				D4F59AAA2EBD137B0041E5FC /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		D4F59AAA2EBD137B0041E5FC /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				D4F59AA92EBD137B0041E5FC /* SimTcpStreamer.app */,
+				D4F59AB72EBD137F0041E5FC /* SimTcpStreamerTests.xctest */,
+				D4F59AC12EBD137F0041E5FC /* SimTcpStreamerUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		D4F59AA82EBD137B0041E5FC /* SimTcpStreamer */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D4F59ACB2EBD137F0041E5FC /* Build configuration list for PBXNativeTarget "SimTcpStreamer" */;
+			buildPhases = (
+				D4F59AA52EBD137B0041E5FC /* Sources */,
+				D4F59AA62EBD137B0041E5FC /* Frameworks */,
+				D4F59AA72EBD137B0041E5FC /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				D4F59AAB2EBD137B0041E5FC /* SimTcpStreamer */,
+			);
+			name = SimTcpStreamer;
+			packageProductDependencies = (
+			);
+			productName = SimTcpStreamer;
+			productReference = D4F59AA92EBD137B0041E5FC /* SimTcpStreamer.app */;
+			productType = "com.apple.product-type.application";
+		};
+		D4F59AB62EBD137F0041E5FC /* SimTcpStreamerTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D4F59ACE2EBD137F0041E5FC /* Build configuration list for PBXNativeTarget "SimTcpStreamerTests" */;
+			buildPhases = (
+				D4F59AB32EBD137F0041E5FC /* Sources */,
+				D4F59AB42EBD137F0041E5FC /* Frameworks */,
+				D4F59AB52EBD137F0041E5FC /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				D4F59AB92EBD137F0041E5FC /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				D4F59ABA2EBD137F0041E5FC /* SimTcpStreamerTests */,
+			);
+			name = SimTcpStreamerTests;
+			packageProductDependencies = (
+			);
+			productName = SimTcpStreamerTests;
+			productReference = D4F59AB72EBD137F0041E5FC /* SimTcpStreamerTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		D4F59AC02EBD137F0041E5FC /* SimTcpStreamerUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = D4F59AD12EBD137F0041E5FC /* Build configuration list for PBXNativeTarget "SimTcpStreamerUITests" */;
+			buildPhases = (
+				D4F59ABD2EBD137F0041E5FC /* Sources */,
+				D4F59ABE2EBD137F0041E5FC /* Frameworks */,
+				D4F59ABF2EBD137F0041E5FC /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				D4F59AC32EBD137F0041E5FC /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				D4F59AC42EBD137F0041E5FC /* SimTcpStreamerUITests */,
+			);
+			name = SimTcpStreamerUITests;
+			packageProductDependencies = (
+			);
+			productName = SimTcpStreamerUITests;
+			productReference = D4F59AC12EBD137F0041E5FC /* SimTcpStreamerUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		D4F59AA12EBD137B0041E5FC /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1630;
+				LastUpgradeCheck = 1630;
+				TargetAttributes = {
+					D4F59AA82EBD137B0041E5FC = {
+						CreatedOnToolsVersion = 16.3;
+					};
+					D4F59AB62EBD137F0041E5FC = {
+						CreatedOnToolsVersion = 16.3;
+						TestTargetID = D4F59AA82EBD137B0041E5FC;
+					};
+					D4F59AC02EBD137F0041E5FC = {
+						CreatedOnToolsVersion = 16.3;
+						TestTargetID = D4F59AA82EBD137B0041E5FC;
+					};
+				};
+			};
+			buildConfigurationList = D4F59AA42EBD137B0041E5FC /* Build configuration list for PBXProject "SimTcpStreamer" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = D4F59AA02EBD137B0041E5FC;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = D4F59AAA2EBD137B0041E5FC /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				D4F59AA82EBD137B0041E5FC /* SimTcpStreamer */,
+				D4F59AB62EBD137F0041E5FC /* SimTcpStreamerTests */,
+				D4F59AC02EBD137F0041E5FC /* SimTcpStreamerUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		D4F59AA72EBD137B0041E5FC /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D4F59AB52EBD137F0041E5FC /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D4F59ABF2EBD137F0041E5FC /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		D4F59AA52EBD137B0041E5FC /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D4F59AB32EBD137F0041E5FC /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D4F59ABD2EBD137F0041E5FC /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		D4F59AB92EBD137F0041E5FC /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = D4F59AA82EBD137B0041E5FC /* SimTcpStreamer */;
+			targetProxy = D4F59AB82EBD137F0041E5FC /* PBXContainerItemProxy */;
+		};
+		D4F59AC32EBD137F0041E5FC /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = D4F59AA82EBD137B0041E5FC /* SimTcpStreamer */;
+			targetProxy = D4F59AC22EBD137F0041E5FC /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		D4F59AC92EBD137F0041E5FC /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.4;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		D4F59ACA2EBD137F0041E5FC /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.4;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+			};
+			name = Release;
+		};
+		D4F59ACC2EBD137F0041E5FC /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = SimTcpStreamer/SimTcpStreamer.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.test.screencap.SimTcpStreamer;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		D4F59ACD2EBD137F0041E5FC /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = SimTcpStreamer/SimTcpStreamer.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.test.screencap.SimTcpStreamer;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				REGISTER_APP_GROUPS = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		D4F59ACF2EBD137F0041E5FC /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.4;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.test.screencap.SimTcpStreamerTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/SimTcpStreamer.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/SimTcpStreamer";
+			};
+			name = Debug;
+		};
+		D4F59AD02EBD137F0041E5FC /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.4;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.test.screencap.SimTcpStreamerTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/SimTcpStreamer.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/SimTcpStreamer";
+			};
+			name = Release;
+		};
+		D4F59AD22EBD137F0041E5FC /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.test.screencap.SimTcpStreamerUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TEST_TARGET_NAME = SimTcpStreamer;
+			};
+			name = Debug;
+		};
+		D4F59AD32EBD137F0041E5FC /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.test.screencap.SimTcpStreamerUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TEST_TARGET_NAME = SimTcpStreamer;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		D4F59AA42EBD137B0041E5FC /* Build configuration list for PBXProject "SimTcpStreamer" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D4F59AC92EBD137F0041E5FC /* Debug */,
+				D4F59ACA2EBD137F0041E5FC /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		D4F59ACB2EBD137F0041E5FC /* Build configuration list for PBXNativeTarget "SimTcpStreamer" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D4F59ACC2EBD137F0041E5FC /* Debug */,
+				D4F59ACD2EBD137F0041E5FC /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		D4F59ACE2EBD137F0041E5FC /* Build configuration list for PBXNativeTarget "SimTcpStreamerTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D4F59ACF2EBD137F0041E5FC /* Debug */,
+				D4F59AD02EBD137F0041E5FC /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		D4F59AD12EBD137F0041E5FC /* Build configuration list for PBXNativeTarget "SimTcpStreamerUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D4F59AD22EBD137F0041E5FC /* Debug */,
+				D4F59AD32EBD137F0041E5FC /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = D4F59AA12EBD137B0041E5FC /* Project object */;
+}

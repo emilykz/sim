@@ -1,0 +1,9 @@
+{
+    "deviceId": "sim-android-36",
+    "windowMatch": "Android Emulator - Pixel_9_API_36",
+    "host": "127.0.0.1",
+    "port": 9001,
+    "platform": "emulator",
+    "fps": 30
+  }
+  

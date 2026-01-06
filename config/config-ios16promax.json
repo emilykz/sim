@@ -1,0 +1,9 @@
+{
+    "deviceId": "sim-ios-16-pro-max",
+    "windowMatch": "iPhone 16 Pro Max",
+    "host": "127.0.0.1",
+    "port": 9001,
+    "platform": "simulator",
+    "fps": 30
+  }
+  
