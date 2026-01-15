@@ -5,18 +5,7 @@ import { WebSocketServer } from 'ws';
 import wrtc from '@roamhq/wrtc';
 import jpeg from 'jpeg-js';
 import { v4 as uuidv4 } from 'uuid';
-
-import { spawn, execFileSync } from 'child_process';
-
-// --- ADB path resolution (Android only) ---
-let ADB = process.env.ADB || process.env.adb || 'adb';
-try {
-  const found = execFileSync('which', ['adb'], { encoding: 'utf8' }).trim();
-  if (found) ADB = found;
-} catch (_) {
-  // ignore; keep fallback
-}
-log('[env] adb=', ADB);
+import { spawn } from 'child_process';
 
 
 const VERBOSE = process.env.VERBOSE === '1';
@@ -25,54 +14,21 @@ function log(...a) { console.log(...a) }
 function warn(...a) { console.warn(...a) }
 function err(...a) { console.error(...a) }
 
-/**
+/** 
  * For each device:
- *    * source – RTCVideoSource (WebRTC frame source).
- *      track – MediaStreamTrack created from source.
- *      viewers – Set of active WebRTC viewers { pc, ws, id }.
- *      count – number of frames pushed so far.
- *      pending – latest video frame buffer { w, h, data } in I420.
- *      pusher – used to represent “pushing enabled” (no longer setInterval).
- *      seeded – whether we’ve already received at least one real frame.
- *
- * CHANGE (PERF): Push is now event-driven (push only when a NEW frame arrives),
- * instead of setInterval pushing the same pending frame repeatedly (forces re-encode).
- */
-const sims = new Map(); // deviceId -> { source, track, viewers:Set, count, pending, pusher, seeded, ... }
-
+    * source – RTCVideoSource (WebRTC frame source).
+      track – MediaStreamTrack created from source.
+      viewers – Set of active WebRTC viewers { pc, ws, id }.
+      count – number of frames pushed so far.
+      pending – latest video frame buffer { w, h, data } in I420.
+      pusher – setInterval timer that pushes pending frames into source.
+      seeded – whether we’ve already received at least one real frame.
+ **/
+const sims = new Map(); // deviceId -> { source, track, viewers:Set, count, pending, pusher, seeded }
 function room(id) {
-  if (!sims.has(id)) {
-    sims.set(id, {
-      source: null,
-      track: null,
-      viewers: new Set(),
-      count: 0,
-      pending: null,
-      pusher: null,
-      seeded: false,
-      controllerId: null, // viewer.id that currently owns control
-
-
-      // CHANGE (PERF): event-driven scheduling state
-      pendingSeq: 0,
-      lastPushedSeq: 0,
-      pushTimer: null,
-      lastPushMs: 0,
-      fps: 24,
-
-      // CHANGE (DEBUG): basic counters to verify we’re not over-pushing
-      stats: {
-        framesIn: 0,
-        framesPushed: 0,
-        i420Ok: 0,
-        i420Bad: 0,
-        lastLog: Date.now(),
-      },
-    });
-  }
+  if (!sims.has(id)) sims.set(id, { source: null, track: null, viewers: new Set(), count: 0, pending: null, pusher: null, seeded: false });
   return sims.get(id);
 }
-
 function ensureSource(r) {
   if (!r.source) {
     r.source = new wrtc.nonstandard.RTCVideoSource();
@@ -80,83 +36,38 @@ function ensureSource(r) {
     log('[video] created RTCVideoSource/Track');
   }
 }
+function ensurePusher(r, fps = 24) {
+  if (r.pusher) return;
 
-/**
- * “Enable pushing” and schedule pushes only when new frames arrive.
- *
- */
-function ensurePusher(r, fps = 15) {
-  // “pusher” now means “pushing enabled”
-  r.pusher = true;
-  r.fps = fps || 24;
-}
+  //Starts a timer that fires every ~1000/fps ms.
+  const interval = Math.max(1, Math.floor(1000 / fps));
 
-/**
- * 
- * Push one frame into WebRTC, but never more than fps. If frames arrive faster, 
- * we drop intermediate and only push latest pending.
- * 
- */
-function schedulePush(r) {
-  if (!r.pusher) return;                 // pushing not enabled
-  if (r.viewers.size === 0) return;      // no viewers -> don't push
-  if (!r.source) return;
+  //On each interval/tick/timer
+  r.pusher = setInterval(() => {
 
-  // If a timer is already scheduled, we’ll let it fire and pick up the latest pending then.
-  if (r.pushTimer) return;
-
-  const intervalMs = Math.max(1, Math.floor(1000 / (r.fps || 24)));
-  const now = Date.now();
-  const sinceLast = now - (r.lastPushMs || 0);
-  const delay = Math.max(0, intervalMs - sinceLast);
-
-  r.pushTimer = setTimeout(() => {
-    r.pushTimer = null;
-
+    //Get the latest video frame buffer 
     const p = r.pending;
+
+    //If there is nothing to push -> return/exit
     if (!p) return;
 
-    // Only push if a NEW frame arrived since last push.
-    if (r.lastPushedSeq === r.pendingSeq) return;
-    r.lastPushedSeq = r.pendingSeq;
-
-    // pushes frame to webrtc
+    //pushes frame to webrtc 
     r.source.onFrame({ width: p.w, height: p.h, data: p.data });
     r.count++;
-    r.lastPushMs = Date.now();
 
-    // DEBUG counters: in vs pushed, plus I420 size sanity
-    r.stats.framesPushed++;
-    const exp = (p.w * p.h * 3) >> 1;
-    if (p.data && p.data.length === exp) r.stats.i420Ok++;
-    else r.stats.i420Bad++;
+    //Log every 60 frames
+    if (r.count % 60 === 0) log(`[push] frames=${r.count} (I420, w=${p.w}, h=${p.h})`);
 
-    // Log every ~5s per device (lightweight)
-    const t = Date.now();
-    if (t - r.stats.lastLog >= 5000) {
-      r.stats.lastLog = t;
-      // log(`[stats] pushed=${r.stats.framesPushed} in=${r.stats.framesIn} i420Ok=${r.stats.i420Ok} i420Bad=${r.stats.i420Bad} viewers=${r.viewers.size} fps=${r.fps}`);
-    }
-
-    // If another new frame arrived while we were pushing (seq advanced), schedule again.
-    if (r.pending && r.lastPushedSeq !== r.pendingSeq) {
-      schedulePush(r);
-    }
-  }, delay);
+  }, interval);
 }
 
-// Stops pushing if there are no viewers
+//Stops the push interval timer if there are no viewers 
 function maybeStopPusher(r) {
   if (r.viewers.size === 0 && r.pusher) {
-    if (r.pushTimer) {
-      clearTimeout(r.pushTimer);
-      r.pushTimer = null;
-    }
+    clearInterval(r.pusher);
     r.pusher = null;
     r.seeded = false;
     r.pending = null;
-    r.pendingSeq = 0;
-    r.lastPushedSeq = 0;
     log('[push] stopped pusher (no viewers)');
   }
 }
@@ -231,92 +142,35 @@ function bgraToI420(width, height, bgra) {
   return rgbaToI420(width, height, rgba);
 }
 
-/**
- * Chunk queue that can read N bytes, zero-copy when possible.
- */
-function makeChunkReader() {
-  let chunks = [];
-  let total = 0;
-
-  function push(chunk) {
-    if (!chunk || chunk.length === 0) return;
-    chunks.push(chunk);
-    total += chunk.length;
-  }
-
-  //If we don’t have enough bytes yet, return null.
-  function read(n) {
-    if (total < n) return null;
-
-    //FAST PATH: if the first chunk alone satisfies the request, return a subarray (zero-copy)
-    const first = chunks[0];
-    if (first.length >= n) {
-      const out = first.subarray(0, n);
-      const rest = first.subarray(n);
-      chunks[0] = rest;
-      if (rest.length === 0) chunks.shift();
-      total -= n;
-      return out;
-    }
-
-    //SLOW PATH: spans multiple chunks -> copy into one buffer
-    const out = Buffer.allocUnsafe(n);
-    let off = 0;
-    while (off < n) {
-      const c = chunks[0];
-      const take = Math.min(c.length, n - off);
-      c.copy(out, off, 0, take);
-      off += take;
-
-      if (take === c.length) {
-        chunks.shift();
-      } else {
-        chunks[0] = c.subarray(take);
-      }
-      total -= take;
-    }
-    return out;
-  }
-
-  function available() { return total; }
-  return { push, read, available };
-}
-
 /* ------------ TCP ingest (video) ------------ */
 const TCP_PORT = 9001;
 const tcp = net.createServer((socket) => {
   let state = 'hello';
   let deviceId = '';
+  let buf = Buffer.alloc(0);
 
-  //PERF: chunk reader instead of Buffer.concat
-  const rdr = makeChunkReader();
-
-  //HARDEN: if TCP splits header/payload, we stash the last header until full payload arrives
-  let pendingFrameHeader = null; // { frameLen, width, height, tsNs }
-
-  //When TCP socket receives data -> process
+  //When TCP socket receives data -> process 
   socket.on('data', (chunk) => {
 
-    //Accumulating incoming bytes
-    rdr.push(chunk);
+    //Accumulating incoming bytes 
+    buf = Buffer.concat([buf, chunk]);
 
     try {
 
       //If state is hello -> parse handshake from Swift Application ("SIMC")
       /**
        * When your Swift streamer connects to Node’s TCP port 9001, it first sends a hello header:
-       *    Field  Size    Meaning
-       *    "SIMC" 4 bytes Magic identifier
-       *    ver    1 byte  Protocol version
-       *    idLen  2 bytes Length of deviceId
-       *    deviceId idLen bytes UTF-8 string
+          Field	Size	Meaning
+          "SIMC"	4 bytes	Magic identifier
+          ver	1 byte	Protocol version
+          idLen	2 bytes	Length of deviceId
+          deviceId	idLen bytes	UTF-8 string
        */
       if (state === 'hello') {
-        if (rdr.available() < 4 + 1 + 2) return;
+        if (buf.length < 4 + 1 + 2) return;
 
-        //Get the magic header
-        const magicBuf = rdr.read(4);
-        const magic = magicBuf.toString('ascii');
+        //Get the magic header 
+        const magic = buf.subarray(0, 4).toString('ascii');
 
         //Check if the header is correct (SIMC)
         if (magic !== 'SIMC') {
@@ -324,26 +178,28 @@ const tcp = net.createServer((socket) => {
           socket.destroy();
           return;
         }
+        //Consume those bytes 
+        buf = buf.subarray(4);
 
-        //Get the version protocol and consume it
-        const verBuf = rdr.read(1);
-        const ver = verBuf[0];
+        //Get the version protocol and consume it 
+        const ver = buf[0];
+        buf = buf.subarray(1);
 
-        //Get the payload/message length/size
-        const idLenBuf = rdr.read(2);
-        const idLen = idLenBuf.readUInt16BE(0);
+        //Get the payload/message length/size 
+        const idLen = buf.readUInt16BE(0);
+        buf = buf.subarray(2);
 
         //Is the payload/message complete -> if not, return
-        if (rdr.available() < idLen) return;
+        if (buf.length < idLen) return;
 
-        //Get the device id
-        const idBuf = rdr.read(idLen);
-        deviceId = idBuf.toString('utf8');
+        //Get the device id  and consume it 
+        deviceId = buf.subarray(0, idLen).toString('utf8');
+        buf = buf.subarray(idLen);
 
-        //Prepare the WebRTC source for this room/device id
-        //PERF: Do NOT start pusher here; only start when there is a viewer.
+        //Prepare the WebRTC source and pusher for this room/device id
         const r = room(deviceId);
         ensureSource(r);
+        ensurePusher(r, 24);
 
         //Set state to frames to start receiving frames....
         state = 'frames';
@@ -352,59 +208,57 @@ const tcp = net.createServer((socket) => {
 
       /**
        * Frame parsing logic - parse as many frames in frame buffer right now
-       *
+       * 
        * per-frame header layout is:
-       *    Field     Size (bytes) Offset
-       *    frameLen  4 (UInt32 BE) 0
-       *    width     4 (UInt32 BE) 4
-       *    height    4 (UInt32 BE) 8
-       *    tsNs      8 (UInt64 BE) 12
-       *    payload   frameLen      20
+            Field	Size (bytes)	Offset
+            frameLen	4 (UInt32 BE)	0
+            width	4 (UInt32 BE)	4
+            height	4 (UInt32 BE)	8
+            tsNs	8 (UInt64 BE)	12
+            payload	frameLen	20
+
+            frameLen → length of the payload that follows.
+            width, height → supposed frame dimensions.
+            tsNs → timestamp in nanoseconds, as a 64-bit big-endian integer.
+
+        For each frame in the TCP buffer:
+            Read header: frameLen, width, height, tsNs.
+            Slice out frameLen bytes as payload.
+            Detect format:
+              I420 (exact or padded)
+              BGRA
+              JPEG
+            Fix mistakes:
+              Bad height in header
+              Slightly mis-sized I420 payloads
+            Convert everything to I420.
+            Save into room(deviceId).pending for WebRTC.
+            Repeat if there’s more data in buf.
        */
       while (state === 'frames') {
 
         //If we don’t even have the full header yet, stop and wait for more bytes.
-        if (rdr.available() < 4 + 4 + 4 + 8) return;
+        if (buf.length < 4 + 4 + 4 + 8) return;
 
-        //Read (or reuse) header
-        if (!pendingFrameHeader) {
-          if (rdr.available() < 20) return;
 
-          const hdr = rdr.read(20);
-          const frameLen = hdr.readUInt32BE(0);
-          const width = hdr.readUInt32BE(4);
-          const height = hdr.readUInt32BE(8);
-          const tsNs = Number(hdr.readBigUInt64BE(12));
+        const frameLen = buf.readUInt32BE(0);
+        let width = buf.readUInt32BE(4);
+        let height = buf.readUInt32BE(8);
+        const tsNs = Number(buf.readBigUInt64BE(12));
 
-          //Sanity checks (protect against desync / bogus lengths)
-          //NOTE: if these trigger, we likely lost framing; safest is to drop the socket and reconnect.
-          const MAX_FRAME_BYTES = 50 * 1024 * 1024; //50MB
-          if (frameLen <= 0 || frameLen > MAX_FRAME_BYTES || width <= 0 || height <= 0 || width > 8192 || height > 8192) {
-            warn(`[tcp] bad header frameLen=${frameLen} w=${width} h=${height} (dropping socket)`);
-            socket.destroy();
-            return;
-          }
+        //If we don’t have 20 + frameLen bytes yet: We have a partial frame → stop and wait for more.
+        if (buf.length < 20 + frameLen) return;
 
-          pendingFrameHeader = { frameLen, width, height, tsNs };
-        }
+        //Get the payload and consume header
+        const payload = buf.subarray(20, 20 + frameLen);
+        buf = buf.subarray(20 + frameLen);
 
-        //If we don’t have payload yet: We have a partial frame → stop and wait for more.
-        //HARDEN: we stashed the parsed header so we won't lose framing across TCP packet boundaries.
-        if (rdr.available() < pendingFrameHeader.frameLen) return;
-
-        // NOTE: width/height are const within this scope for safety (don't mutate header vars)
-        const { frameLen, width, height, tsNs } = pendingFrameHeader;
-        pendingFrameHeader = null;
-
-        //Get the payload
-        const payload = rdr.read(frameLen);
-
-        //Get the room for this device
+        //Get the room for this device 
         const r = room(deviceId);
         ensureSource(r);
-        //PERF: Do NOT ensurePusher here; only start when there is a viewer.
+        ensurePusher(r, 24);
 
-        //Detect frame type & compute expected sizes
+        //Detect frame type & compute expected sizes        
         const isJPEG = payload.length >= 3 && payload[0] === 0xFF && payload[1] === 0xD8 && payload[2] === 0xFF;
         const expRGBA = width * height * 4;
         let expI420 = (width * height * 3) >> 1;
@@ -413,8 +267,6 @@ const tcp = net.createServer((socket) => {
         //Choose how to interpret payload & convert to I420
         try {
           let i420;
-          let outW = width;
-          let outH = height;
 
           //Try to fix I420 header mismatch if payload length doesn’t match
           if (!isJPEG && payload.length !== expI420) {
@@ -423,38 +275,35 @@ const tcp = net.createServer((socket) => {
               const inferredH = num / den;
               if ((inferredH & 1) === 0) {
                 warn(`[tcp] I420 header mismatch: len=${payload.length} for ${width}x${height} → inferring height=${inferredH}`);
-                outH = inferredH;
-                expI420 = (outW * outH * 3) >> 1;
+                height = inferredH;
+                expI420 = (width * height * 3) >> 1;
               }
             }
           }
-
-          //Exact I420
+          //Exact I420 
           if (!isJPEG && payload.length === expI420) {
-            if (VERBOSE) log(`[tcp] I420 direct len=${payload.length} w=${outW} h=${outH} ts=${tsNs}`);
-            //PERF: zero-copy (payload already a Buffer)
-            i420 = payload;
+            if (VERBOSE) log(`[tcp] I420 direct len=${payload.length} w=${width} h=${height} ts=${tsNs}`);
+            i420 = Buffer.from(payload);
           }
           //Slightly-too-long I420 (extra padding)
-          else if (!isJPEG && payload.length > expI420 && payload.length - expI420 <= outW) {
+          else if (!isJPEG && payload.length > expI420 && payload.length - expI420 <= width) {
             warn(`[tcp] I420 len=${payload.length} > exp=${expI420} — clamping`);
-            //PERF: zero-copy slice
-            i420 = payload.subarray(0, expI420);
+            i420 = Buffer.from(payload.subarray(0, expI420));
           }
           // BGRA raw frame
           else if (looksRaw && payload.length === expRGBA) {
             warn('[tcp] got BGRA — converting to I420');
-            i420 = bgraToI420(outW, outH, payload);
+            i420 = bgraToI420(width, height, payload);
           }
           // JPEG compressed frame  JPEG → decode → I420
           else if (isJPEG) {
             const raw = jpeg.decode(payload, { useTArray: true });
             const rgba = Buffer.from(raw.data.buffer, raw.data.byteOffset, raw.data.byteLength);
             i420 = rgbaToI420(raw.width, raw.height, rgba);
-            outW = raw.width; outH = raw.height;
-            const expFromJpeg = (outW * outH * 3) >> 1;
-            if (i420.length !== expFromJpeg) i420 = i420.subarray(0, expFromJpeg);
-            if (VERBOSE) log(`[tcp] JPEG len=${payload.length} → I420 ${outW}x${outH}`);
+            width = raw.width; height = raw.height;
+            const expFromJpeg = (width * height * 3) >> 1;
+            if (i420.length !== expFromJpeg) i420 = Buffer.from(i420.subarray(0, expFromJpeg));
+            if (VERBOSE) log(`[tcp] JPEG len=${payload.length} → I420 ${width}x${height}`);
           }
           // Case 5: unknown format, drop
           else {
@@ -462,19 +311,9 @@ const tcp = net.createServer((socket) => {
             continue;
           }
 
-          //Updates the latest frame for this device id
-          r.pending = { w: outW, h: outH, data: i420 };
-          r.seeded = true;
-
-          // CHANGE (DEBUG): count incoming frames and sanity-check I420 sizing
-          r.stats.framesIn++;
-          const exp = (outW * outH * 3) >> 1;
-          if (i420 && i420.length === exp) r.stats.i420Ok++;
-          else r.stats.i420Bad++;
-
-          // CHANGE (PERF): Push only when a new frame arrives (and only if a viewer exists)
-          r.pendingSeq++;
-          schedulePush(r);
+          //Updates the latest frame for this device id 
+          room(deviceId).pending = { w: width, h: height, data: i420 };
+          room(deviceId).seeded = true;
 
         } catch (e) {
           err('[tcp] ingest error for', deviceId, e?.message || e);
@@ -493,32 +332,23 @@ tcp.listen(TCP_PORT, () => log(`TCP ingest :${TCP_PORT}`));
 /* ------------ Control TCP (downstream to Swift) ------------ */
 const CONTROL_PORT = 9002;
 const ctlServer = net.createServer((sock) => {
+  let buf = Buffer.alloc(0);
   let deviceId = '';
 
-  //PERF: chunk reader instead of Buffer.concat
-  const rdr = makeChunkReader();
-
   sock.on('data', (chunk) => {
-    rdr.push(chunk);
-
+    buf = Buffer.concat([buf, chunk]);
     if (!deviceId) {
-      if (rdr.available() < 4 + 1 + 2) return;
-
-      const magicBuf = rdr.read(4);
-      const magic = magicBuf.toString('ascii');
+      if (buf.length < 4 + 1 + 2) return;
+      const magic = buf.subarray(0, 4).toString('ascii');
       if (magic !== 'SIMK') { sock.destroy(); return; }
-
-      const verBuf = rdr.read(1);
-      const ver = verBuf[0];
-
-      const idLenBuf = rdr.read(2);
-      const idLen = idLenBuf.readUInt16BE(0);
-
-      if (rdr.available() < idLen) return;
-
-      const idBuf = rdr.read(idLen);
-      deviceId = idBuf.toString('utf8');
-
+      buf = buf.subarray(4);
+      const ver = buf[0]; 
+      buf = buf.subarray(1);
+      const idLen = buf.readUInt16BE(0); 
+      buf = buf.subarray(2);
+      if (buf.length < idLen) return;
+      deviceId = buf.subarray(0, idLen).toString('utf8'); 
+      buf = buf.subarray(idLen);
       controlSockets.set(deviceId, sock);
       log('[ctl] hello from', deviceId, 'ver', ver);
     }
@@ -539,86 +369,6 @@ ctlServer.listen(CONTROL_PORT, () => log(`Control TCP :${CONTROL_PORT}`));
 const adbSessions = new Map();
 // simple pointer state: deviceId -> { downX, downY, downTime }
 const pointerState = new Map();
-// emulator config data: deviceId -> { w, h, rotation, source, ts }
-const androidInputInfo = new Map();
-
-
-function parseWmSize(out) {
-  // Examples:
-  //   Physical size: 1080x2400
-  //   Override size: 720x1600
-  const override = /Override size:\s*(\d+)x(\d+)/i.exec(out);
-  if (override) return { w: Number(override[1]), h: Number(override[2]), source: 'override' };
-  const physical = /Physical size:\s*(\d+)x(\d+)/i.exec(out);
-  if (physical) return { w: Number(physical[1]), h: Number(physical[2]), source: 'physical' };
-  const any = /(\d+)x(\d+)/.exec(out);
-  if (any) return { w: Number(any[1]), h: Number(any[2]), source: 'fallback' };
-  return null;
-}
-
-function parseRotationFromDumpsys(out) {
-  // Common patterns across Android versions
-  //   mCurrentRotation=ROTATION_0 / ROTATION_1 ...
-  //   mRotation=0
-  //   rotation 0
-  //   SurfaceOrientation: 0
-  const m1 = /mCurrentRotation\s*=\s*ROTATION_(\d)/i.exec(out);
-  if (m1) return Number(m1[1]) * 90;
-  const m2 = /mRotation\s*=\s*(\d)/i.exec(out);
-  if (m2) return Number(m2[1]) * 90;
-  const m3 = /SurfaceOrientation\s*:\s*(\d)/i.exec(out);
-  if (m3) return Number(m3[1]) * 90;
-  const m4 = /\brotation\b\s*[:=]?\s*(\d+)/i.exec(out);
-  if (m4) {
-    const v = Number(m4[1]);
-    if (v === 0 || v === 90 || v === 180 || v === 270) return v;
-    if (v >= 0 && v <= 3) return v * 90;
-  }
-  return 0;
-}
-
-function ensureAndroidInputInfo(deviceId, serial) {
-  const cached = androidInputInfo.get(deviceId);
-  if (cached && cached.w && cached.h) return cached;
-
-  try {
-    // Query device once and cache.
-    const wmOut = execFileSync(ADB, ['-s', serial, 'shell', 'wm', 'size'], { encoding: 'utf8' });
-    const size = parseWmSize(wmOut || '');
-    let w = size?.w || 1080;
-    let h = size?.h || 2400;
-    let source = size?.source || 'default';
-
-    let rotation = 0;
-    try {
-      const dOut = execFileSync(ADB, ['-s', serial, 'shell', 'dumpsys', 'display'], { encoding: 'utf8' });
-      rotation = parseRotationFromDumpsys(dOut || '');
-    } catch (e) {
-      rotation = 0;
-    }
-
-    const info = { w, h, rotation, source, ts: Date.now() };
-    androidInputInfo.set(deviceId, info);
-
-    // Useful debug: compare input space vs stream space
-    const r = room(deviceId);
-    const sw = r.pending?.w;
-    const sh = r.pending?.h;
-    log('[adb]', deviceId, `inputSpace=${w}x${h} (${source}) rotation=${rotation}` + (sw && sh ? ` stream=${sw}x${sh}` : ''));
-
-    return info;
-  } catch (e) {
-    // Fall back to stream size if available.
-    const r = room(deviceId);
-    const w = r.pending?.w || 1080;
-    const h = r.pending?.h || 2400;
-    const info = { w, h, rotation: 0, source: 'fallback', ts: Date.now() };
-    androidInputInfo.set(deviceId, info);
-    warn('[adb]', deviceId, 'ensureAndroidInputInfo failed; using fallback', `${w}x${h}`, e?.message || e);
-    return info;
-  }
-}
-
 
 /**
  * Map logical deviceId to adb serial.
@@ -627,6 +377,7 @@ function ensureAndroidInputInfo(deviceId, serial) {
  * adjust this to map "sim-android-36" -> "emulator-5554" or similar.
  */
 function adbSerialFor(deviceId) {
+
   if (deviceId === 'sim-android-36') return 'emulator-5554';
   return deviceId;
 }
@@ -653,10 +404,7 @@ function ensureAdbSession(deviceId) {
   const serial = adbSerialFor(deviceId);
   log('[adb]', deviceId, 'starting adb shell for', serial);
 
-  // Cache input coordinate space (wm size / rotation) once per session.
-  ensureAndroidInputInfo(deviceId, serial);
-
-  const proc = spawn(ADB, ['-s', serial, 'shell'], {
+  const proc = spawn('adb', ['-s', serial, 'shell'], {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   sessions++;
@@ -716,24 +464,15 @@ function drainAdbQueue(deviceId) {
  */
 function normToPixels(deviceId, x, y) {
   const r = room(deviceId);
-
-  // CHANGE (BUGFIX): these were "1080 || ..." which always picked 1080
-  let pw = r.pending?.w || 1080;
-  let ph = r.pending?.h || 2400;
-
-  const serial = adbSerialFor(deviceId);
-  const info = ensureAndroidInputInfo(deviceId, serial);
-  pw = info.w;
-  ph = info.h;
-
-
+  const pw = 1080 || r.pending?.w || 1080;
+  const ph = 2424 || r.pending?.h || 2400;
   const px = Math.max(0, Math.min(pw - 1, Math.round(x * pw)));
   const py = Math.max(0, Math.min(ph - 1, Math.round(y * ph)));
   return { x: px, y: py };
 }
 
 function handleAndroidPointer(deviceId, msg) {
-  const { kind, x, y, dx = 0, dy = 0 } = msg;
+  const { kind, x, y, dy } = msg;
   const now = Date.now();
   let state = pointerState.get(deviceId) || null;
 
@@ -775,34 +514,32 @@ function handleAndroidPointer(deviceId, msg) {
   }
 
   if (kind === 'scroll') {
-    const serial = adbSerialFor(deviceId);
-    const info = ensureAndroidInputInfo(deviceId, serial);
-    const ph = info.h;
-
-    const total = -(dy || 0);
-    if (!total) return;
-
+    // Map wheel scroll to swipe near center of screen
+    const r = room(deviceId);
+    const ph = 2424 || r.pending?.h || 2400;
     const { x: cx, y: cy } = normToPixels(deviceId, 0.5, 0.5);
-
-    // Lighter scroll: ~6%..22% of screen height
-    const mag = Math.min(1, Math.abs(total) / 320);
-    const DIST = Math.max(40, Math.round(ph * (0.06 + 0.16 * mag)));
-
+    const DIST = Math.round(ph * 0.15);
     const duration = 200;
 
-    const x1 = cx;
-    const y1 = cy;
-    const x2 = cx;
+    let x1 = cx;
+    let y1 = cy;
+    let x2 = cx;
+    let y2 = cy;
 
-    const y2 = total < 0
-      ? Math.max(0, y1 - DIST)
-      : Math.min(ph - 1, y1 + DIST);
+    if (typeof dy === 'number' && dy > 0) {
+      // scroll down => swipe up
+      y2 = Math.max(0, y1 - DIST);
+    } else if (typeof dy === 'number' && dy < 0) {
+      // scroll up => swipe down
+      y2 = Math.min(ph - 1, y1 + DIST);
+    }
 
-    enqueueAdbCommand(deviceId, `input swipe ${x1} ${y1} ${x2} ${y2} ${duration}`);
+    enqueueAdbCommand(
+      deviceId,
+      `input swipe ${x1} ${y1} ${x2} ${y2} ${duration}`,
+    );
   }
-
 }
-
 
 function escapeAdbText(text) {
   // basic escaping: spaces & quotes
@@ -839,31 +576,12 @@ function handleAndroidKey(deviceId, msg) {
   }
 }
 
+
+
 /* ------------ signaling (WS) ------------ */
 
 const httpServer = http.createServer();
 const wss = new WebSocketServer({ server: httpServer, path: '/signal' });
-
-
-// CHANGE (CONTROL LOCK): broadcast who has control
-function broadcastControlState(deviceId) {
-  const r = room(deviceId);
-  const msg = JSON.stringify({
-    type: 'control-state',
-    deviceId,
-    controllerId: r.controllerId || null,
-  });
-  for (const v of r.viewers) {
-    try { v.ws.send(msg); } catch (_) { }
-  }
-}
-
-// CHANGE (CONTROL LOCK): pick the “next” viewer in insertion order (Set preserves insertion order)
-function pickNextControllerId(r) {
-  for (const v of r.viewers) return v.id;
-  return null;
-}
-
 
 wss.on('connection', (ws) => {
   let deviceId = null;
@@ -877,21 +595,17 @@ wss.on('connection', (ws) => {
 
     // control from browser → Swift (with logs)
     if (msg.type === 'pointer' || msg.type === 'key' || msg.type === 'text') {
-
-      // CHANGE (CONTROL LOCK): only controller can send input
-      const r = room(deviceId);
-      if (!viewer || r.controllerId !== viewer.id) {
-        // optional: tell the client it’s view-only
-        try {
-          ws.send(JSON.stringify({
-            type: 'control-denied',
-            deviceId,
-            controllerId: r.controllerId || null,
-          }));
-        } catch (_) { }
-        return;
-      }
-
+      // DEBUG: log every incoming control event
+      log(
+        '[signal] ctl',
+        'deviceId=' + deviceId,
+        'type=' + msg.type,
+        'kind=' + (msg.kind || ''),
+        'key=' + (msg.key || ''),
+        'code=' + (msg.code || ''),
+        'x=' + (msg.x ?? ''),
+        'y=' + (msg.y ?? '')
+      );
 
       // Android/emulator path: use adb input commands
       if (isAndroidDevice(deviceId)) {
@@ -936,16 +650,12 @@ wss.on('connection', (ws) => {
       const r = room(deviceId);
       const wasEmpty = r.viewers.size === 0;
       ensureSource(r);
-
-      // CHANGE (PERF): enable event-driven pusher (no interval)
       ensurePusher(r, 24);
-
       log('[signal] viewer for', deviceId);
 
       // FIRST viewer: ensure we have something to show (slate if needed)
       if (!r.seeded && !r.pending) {
         r.pending = makeI420Slate(360, 640, 32, 128, 128);
-        r.pendingSeq++;
         log('[signal] seeding slate for', deviceId);
       }
 
@@ -969,25 +679,10 @@ wss.on('connection', (ws) => {
       viewer = { id: uuidv4(), pc, ws };
       r.viewers.add(viewer);
 
-      // CHANGE (CONTROL LOCK): tell this client its viewerId
-      try {
-        ws.send(JSON.stringify({ type: 'viewer-id', deviceId, viewerId: viewer.id }));
-      } catch (_) { }
-
-      // CHANGE (CONTROL LOCK): first viewer becomes controller automatically
-      if (!r.controllerId) {
-        r.controllerId = viewer.id;
-      }
-      broadcastControlState(deviceId);
-
       if (wasEmpty) {
         // FIRST viewer: tell Mac to start streaming
         sendStreamCommand(deviceId, 'start');
       }
-
-      // CHANGE (PERF): push immediately if we already have a pending frame (e.g., slate)
-      schedulePush(r);
-
       return;
     }
 
@@ -1013,12 +708,6 @@ wss.on('connection', (ws) => {
     try { viewer.pc.close(); } catch { }
     r.viewers.delete(viewer);
     log('[signal] viewer closed for', deviceId);
-
-    // CHANGE (CONTROL LOCK): if controller left, hand control to next viewer
-    if (r.controllerId === viewer.id) {
-      r.controllerId = pickNextControllerId(r);
-      broadcastControlState(deviceId);
-    }
 
     if (r.viewers.size === 0) {
       // LAST viewer: tell Mac to stop streaming

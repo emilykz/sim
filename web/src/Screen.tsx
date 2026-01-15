@@ -1,5 +1,5 @@
 // src/Screen.tsx
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 
 type Props = {
   deviceId: string;
@@ -10,6 +10,13 @@ type Props = {
 export default function Screen({ deviceId, signalUrl, videoWidthPx = 360 }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
 
+  const [plus, setPlus] = useState<{ x: number; y: number; on: boolean }>({
+    x: 0,
+    y: 0,
+    on: false,
+  });
+  
+  
   useEffect(() => {
     const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
     const ws = new WebSocket(signalUrl);
@@ -52,11 +59,47 @@ export default function Screen({ deviceId, signalUrl, videoWidthPx = 360 }: Prop
   }, [deviceId, signalUrl, videoWidthPx]);
 
   return (
-    <div style={{ display: 'inline-block' }}>
-      <video ref={videoRef} />
-      <div style={{ fontSize: 12, color: '#888', marginTop: 4 }}>
-        {deviceId} • width {videoWidthPx}px
+    <div
+    ref={wrapRef}
+    style={{
+      position: 'relative',
+      display: 'inline-block',
+      cursor: 'none', // 👈 hide system cursor
+    }}
+    onMouseEnter={() => setPlus(p => ({ ...p, on: true }))}
+    onMouseLeave={() => setPlus(p => ({ ...p, on: false }))}
+    onMouseMove={(e) => {
+      const rect = e.currentTarget.getBoundingClientRect();
+      setPlus({
+        on: true,
+        x: e.clientX - rect.left,
+        y: e.clientY - rect.top,
+      });
+    }}
+  >
+    <video ref={videoRef} />
+  
+    {/* + cursor overlay */}
+    {plus.on && (
+      <div
+        style={{
+          position: 'absolute',
+          left: plus.x,
+          top: plus.y,
+          transform: 'translate(-50%, -50%)',
+          fontSize: 22,
+          fontWeight: 700,
+          color: 'rgba(0, 255, 255, 0.95)',
+          textShadow: '0 0 6px rgba(0,0,0,0.8)',
+          pointerEvents: 'none',
+          userSelect: 'none',
+          lineHeight: 1,
+        }}
+      >
+        +
       </div>
-    </div>
+    )}
+  </div>
+  
   );
 }

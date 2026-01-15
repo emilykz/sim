@@ -799,8 +799,9 @@ final class SimTcpStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             conf.capturesAudio = false
             conf.showsCursor = false
             conf.queueDepth = 2
-            conf.colorSpaceName = CGColorSpace.sRGB
-            conf.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange // NV12
+
+            conf.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+           // conf.colorSpaceName = nil
 
             // crop top toolbar (~7%)
             let toolbarPct: CGFloat = 0.07
