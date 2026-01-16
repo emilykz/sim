@@ -268,6 +268,11 @@ final class SimTcpStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     private var frameIntervalNs: Int64 = 0
     private var sentCount = 0
 
+    // CHANGE (PERF): dynamic quality knobs (can be updated at runtime via control channel)
+    private var requestedFps: Int = 30
+    private var requestedMaxWidth: Int = 540
+    private var pendingReconfigure: DispatchWorkItem?
+
     // keep-alive - a GCD timer that fires periodically.
     // These help send repeated frames even if capture stalls (keep WebRTC alive)
     private var keepAliveTimer: DispatchSourceTimer?
@@ -297,7 +302,11 @@ final class SimTcpStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
     //Only connect to Node (TCP ingest + control). Capture will be started/stopped via control messages.
     func connect(_ cfg: Config) async throws {
         self.cfg = cfg //saves config
-        self.frameIntervalNs = Int64(1_000_000_000 / max(1, cfg.fps)) //target nanoseconds between frames
+        // CHANGE (PERF): initialize quality knobs from config (server may later override via control)
+        self.requestedFps = max(1, cfg.fps)
+        self.requestedMaxWidth = 540
+
+        self.frameIntervalNs = Int64(1_000_000_000 / max(1, self.requestedFps)) //target nanoseconds between frames
         self.sentCount = 0
 
         print("[connect] host=\(cfg.host):\(cfg.port) deviceId=\(cfg.deviceId) fps=\(cfg.fps)")
@@ -340,6 +349,34 @@ final class SimTcpStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         isCapturing = false
     }
 
+    // CHANGE (PERF): debounce capture restarts when quality changes.
+    // We restart only when maxWidth changes (fps changes are handled by pacing).
+    private func scheduleReconfigureCapture() {
+        pendingReconfigure?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard self.isCapturing else { return }
+
+            print("[sc] reconfigure capture (maxWidth=\(self.requestedMaxWidth), fps=\(self.requestedFps))")
+
+            // Stop + start in order, ensuring ScreenCaptureKit resources are released.
+            Task {
+                do {
+                    if let sc = self.scStream {
+                        try await sc.stopCapture()
+                    }
+                } catch {
+                    print("[sc] stopCapture during reconfigure error:", error.localizedDescription)
+                }
+                self.scStream = nil
+                self.isCapturing = false
+                try? await self.startCaptureInternal()
+            }
+        }
+        pendingReconfigure = work
+        q.asyncAfter(deadline: .now() + .milliseconds(250), execute: work)
+    }
+
     // MARK: TCP video
     /**
      Turn cfg.host and cfg.port into a NWConnection target (throw if invalid port).
@@ -359,8 +396,11 @@ final class SimTcpStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             throw NSError(domain: "SimTcpStreamer", code: -10, userInfo: [NSLocalizedDescriptionKey: "Invalid port"])
         }
         
-        //Create a TCP connection
-        let c = NWConnection(host: host, port: port, using: .tcp);
+        // CHANGE (PERF): disable Nagle for low-latency video
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.noDelay = true
+        let params = NWParameters(tls: nil, tcp: tcpOptions)
+        let c = NWConnection(host: host, port: port, using: params);
         
         //Stores the connection to be used in other methods
         self.conn = c
@@ -438,7 +478,11 @@ final class SimTcpStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let port = NWEndpoint.Port(rawValue: 9002) else {
             throw NSError(domain: "SimTcpStreamer", code: -20, userInfo: [NSLocalizedDescriptionKey: "Invalid control port"])
         }
-        let c = NWConnection(host: host, port: port, using: .tcp);
+        // CHANGE (PERF): disable Nagle for low-latency control
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.noDelay = true
+        let params = NWParameters(tls: nil, tcp: tcpOptions)
+        let c = NWConnection(host: host, port: port, using: params);
         self.ctlConn = c
         
         c.stateUpdateHandler = { [weak self] st in
@@ -556,6 +600,24 @@ final class SimTcpStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             } else if action == "stop" {
                 print("[ctl] stream stop requested")
                 self.stopCaptureIfNeeded()
+            }
+        case "quality":
+            // Expected payload: { type: "quality", fps: Int, maxWidth: Int }
+            let newFps = max(1, (obj["fps"] as? Int) ?? self.requestedFps)
+            let newMaxW = max(2, (obj["maxWidth"] as? Int) ?? self.requestedMaxWidth)
+
+            // Update pacing immediately
+            self.requestedFps = newFps
+            self.frameIntervalNs = Int64(1_000_000_000 / max(1, newFps))
+
+            // If only fps changed, we can keep capture running (keepalive already paces send).
+            // If maxWidth changed, we need to restart ScreenCaptureKit with a new configuration.
+            if newMaxW != self.requestedMaxWidth {
+                self.requestedMaxWidth = newMaxW
+                print("[ctl] quality update → fps=\(newFps) maxWidth=\(newMaxW) (reconfigure)")
+                self.scheduleReconfigureCapture()
+            } else {
+                print("[ctl] quality update → fps=\(newFps) maxWidth=\(newMaxW)")
             }
         case "pointer":
             // TODO: map pointer events to CGEvents for input injection
@@ -795,7 +857,8 @@ final class SimTcpStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
             
             //Create and configure SCStreamConfiguration
             let conf = SCStreamConfiguration()
-            conf.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+            // CHANGE (PERF): allow server-driven FPS (quality messages)
+            conf.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(max(1, self.requestedFps)))
             conf.capturesAudio = false
             conf.showsCursor = false
             conf.queueDepth = 2
@@ -838,10 +901,10 @@ final class SimTcpStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
             self.cropYPoints = cropY
 
-            // scale to even dims ≤ 540px wide (adjust as needed)
+            // CHANGE (PERF): scale to even dims ≤ requestedMaxWidth (server-driven)
             let srcW = Int(r.width * self.screenScale)
             let srcH = Int(cropH * self.screenScale)
-            var w = min(srcW, 540)
+            var w = min(srcW, max(2, self.requestedMaxWidth))
             var h = (w * srcH) / srcW
             if (w & 1) != 0 { w -= 1 }
             if (h & 1) != 0 { h -= 1 }
@@ -881,7 +944,7 @@ final class SimTcpStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // MARK: Keepalive pacing
     private func startKeepAlive() {
-        let intervalMs = max(10, Int(1000 / max(1, cfg.fps)))
+        let intervalMs = max(10, Int(1000 / max(1, self.requestedFps)))
         let t = DispatchSource.makeTimerSource(queue: q)
         t.schedule(deadline: .now() + .milliseconds(intervalMs), repeating: .milliseconds(intervalMs))
         t.setEventHandler { [weak self] in
@@ -956,4 +1019,5 @@ final class SimTcpStreamer: NSObject, SCStreamOutput, SCStreamDelegate {
         if sentCount % 60 == 0 { print("[tx] I420 frames=\(sentCount) size=\(i420.count) w=\(w) h=\(h)") }
     }
 }
+
 
