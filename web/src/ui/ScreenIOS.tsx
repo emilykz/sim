@@ -3,8 +3,17 @@ import { useParams } from 'react-router-dom'
 import { Box, Button, Slider, Typography } from '@mui/material'
 import { devices } from '../devices'
 
+
+// Prefer same-host signaling: viewer opened at http://<HOST>:5173
+// -> signaling goes to ws://<HOST>:8080/signal
+function computeSignalUrl() {
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const host = window.location.hostname // IMPORTANT: NOT "localhost"
+    const port = 8080
+    return `${proto}//${host}:${port}/signal`
+  }
 //Signaling URL to connect to Node for establishing webrtc connection & control
-const SIGNAL_URL = `ws://${window.location.hostname}:8080/signal`
+const SIGNAL_URL = computeSignalUrl()
 const AUTO_MAX_FIT = 0.7; // never auto-zoom beyond 70%
 
 export default function ScreenIOS() {
@@ -28,10 +37,8 @@ export default function ScreenIOS() {
     });
 
     const wsRef = useRef<WebSocket | null>(null)
-
     const [viewerId, setViewerId] = useState<string | null>(null)
     const [controllerId, setControllerId] = useState<string | null>(null)
-
     const canInteract = viewerId && controllerId && viewerId === controllerId
     const canInteractRef = useRef(false)
     useEffect(() => {
@@ -90,6 +97,7 @@ export default function ScreenIOS() {
         const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] })
         const ws = new WebSocket(SIGNAL_URL)
         wsRef.current = ws
+        const stopHud = startStatsHud(pc, deviceId);
 
         //Fires when client recieves a track
         pc.ontrack = (event) => {
@@ -388,6 +396,77 @@ export default function ScreenIOS() {
             wsRef.current = null
         }
     }, [device, applyZoom])
+
+
+    type QoS = {
+        rttMs?: number;
+        jitterMs?: number;
+        lossPct?: number;
+        kbps?: number;
+        fps?: number;
+        framesDropped?: number;
+        framesDecoded?: number;
+      };
+      
+      function startStatsHud(pc: RTCPeerConnection, label = "viewer") {
+        let lastBytes = 0;
+        let lastTs = 0;
+      
+        const iv = window.setInterval(async () => {
+          const stats = await pc.getStats();
+      
+          let rttMs: number | undefined;
+          let jitterMs: number | undefined;
+          let packetsLost = 0;
+          let packetsRecv = 0;
+          let bytesRecv = 0;
+          let fps: number | undefined;
+          let framesDropped: number | undefined;
+          let framesDecoded: number | undefined;
+      
+          stats.forEach((r: any) => {
+            if (r.type === "candidate-pair" && r.state === "succeeded" && r.nominated) {
+              if (typeof r.currentRoundTripTime === "number") rttMs = r.currentRoundTripTime * 1000;
+            }
+            if (r.type === "inbound-rtp" && r.kind === "video") {
+              if (typeof r.jitter === "number") jitterMs = r.jitter * 1000;
+              if (typeof r.packetsLost === "number") packetsLost = r.packetsLost;
+              if (typeof r.packetsReceived === "number") packetsRecv = r.packetsReceived;
+              if (typeof r.bytesReceived === "number") bytesRecv = r.bytesReceived;
+              if (typeof r.framesPerSecond === "number") fps = r.framesPerSecond;
+              if (typeof r.framesDropped === "number") framesDropped = r.framesDropped;
+              if (typeof r.framesDecoded === "number") framesDecoded = r.framesDecoded;
+            }
+          });
+      
+          const now = Date.now();
+          let kbps: number | undefined;
+          if (lastTs && bytesRecv >= lastBytes) {
+            const dt = (now - lastTs) / 1000;
+            const dBytes = bytesRecv - lastBytes;
+            kbps = (dBytes * 8) / 1000 / dt;
+          }
+          lastBytes = bytesRecv;
+          lastTs = now;
+      
+          const lossPct = (packetsRecv + packetsLost) > 0 ? (packetsLost / (packetsRecv + packetsLost)) * 100 : 0;
+      
+          const qos: QoS = {
+            rttMs: rttMs ? Math.round(rttMs) : undefined,
+            jitterMs: jitterMs ? Math.round(jitterMs) : undefined,
+            lossPct: Math.round(lossPct * 10) / 10,
+            kbps: kbps ? Math.round(kbps) : undefined,
+            fps,
+            framesDropped,
+            framesDecoded
+          };
+      
+          console.log(`[qos:${label}]`, qos);
+        }, 1000);
+      
+        return () => window.clearInterval(iv);
+      }
+      
 
     if (!device) {
         return <Box sx={{ p: 3 }}><Typography variant="h5">Device not found</Typography></Box>

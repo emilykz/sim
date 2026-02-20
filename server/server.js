@@ -60,6 +60,9 @@ function room(id) {
       lastPushMs: 0,
       fps: 24,
 
+      // CHANGE (PERF): adaptive quality state (shared per device)
+      qualityState: null,
+
       // CHANGE (DEBUG): basic counters to verify we’re not over-pushing
       stats: {
         framesIn: 0,
@@ -164,24 +167,159 @@ function maybeStopPusher(r) {
 /* ------------ control sockets (input) ------------ */
 const controlSockets = new Map(); // deviceId -> net.Socket
 
+// CHANGE (PERF/HARDEN): queue control messages until the device control socket arrives.
+// This fixes the race where the viewer connects before the Mac agent has completed its SIMK hello.
+const pendingCtl = new Map(); // deviceId -> Buffer[]
+
+function _encodeCtl(obj) {
+  const payload = Buffer.from(JSON.stringify(obj), 'utf8');
+  const header = Buffer.allocUnsafe(4);
+  header.writeUInt32BE(payload.length, 0);
+  return [header, payload];
+}
+
+function sendCtl(deviceId, obj) {
+  const sock = controlSockets.get(deviceId);
+  const parts = _encodeCtl(obj);
+
+  if (!sock) {
+    const q = pendingCtl.get(deviceId) || [];
+    q.push(...parts);
+    pendingCtl.set(deviceId, q);
+    return false;
+  }
+  try {
+    for (const b of parts) sock.write(b);
+    return true;
+  } catch (e) {
+    err('[ctl] write error for', deviceId, e?.message || e);
+    return false;
+  }
+}
+
+function flushCtl(deviceId) {
+  const sock = controlSockets.get(deviceId);
+  const q = pendingCtl.get(deviceId);
+  if (!sock || !q || q.length === 0) return;
+  try {
+    for (const b of q) sock.write(b);
+  } catch (e) {
+    err('[ctl] flush error for', deviceId, e?.message || e);
+  }
+  pendingCtl.delete(deviceId);
+}
+
 // helper: send a stream start/stop command to the Mac streamer
 function sendStreamCommand(deviceId, action) {
-  const sock = controlSockets.get(deviceId);
-  if (!sock) {
-    warn('[ctl] no control socket for', deviceId, '— cannot send stream', action);
-    return;
-  }
   const msg = { type: 'stream', action, deviceId };
-  try {
-    //Message format (4-byte big-endian length. + payload/message itself)
-    const payload = Buffer.from(JSON.stringify(msg), 'utf8');
-    const header = Buffer.allocUnsafe(4);
-    header.writeUInt32BE(payload.length, 0);
-    sock.write(header);
-    sock.write(payload);
+  const ok = sendCtl(deviceId, msg);
+  if (!ok) {
+    warn('[ctl] no control socket for', deviceId, '— queued stream', action);
+  } else {
     log('[ctl] →', deviceId, 'stream', action);
-  } catch (e) {
-    err('[ctl] stream command error for', deviceId, e?.message || e);
+  }
+}
+
+function sendQuality(deviceId, q) {
+  const msg = { type: 'quality', ...q, deviceId };
+  const ok = sendCtl(deviceId, msg);
+  if (!ok) {
+    warn('[ctl] no control socket for', deviceId, '— queued quality', JSON.stringify(q));
+  } else {
+    log('[ctl] →', deviceId, 'quality', JSON.stringify(q));
+  }
+}
+
+// CHANGE (PERF): adaptive quality (no TURN/SFU required).
+// We use sender-side WebRTC stats (RTT + packet loss) and apply:
+//   1) WebRTC sender caps (maxBitrate/maxFramerate)
+//   2) Capture-side request (fps + maxWidth) via control socket
+// With hysteresis + min time between changes to avoid oscillation.
+
+const QUALITY_PROFILES = {
+  high: { name: 'high', maxWidth: 1080, fps: 30, maxBitrate: 2_500_000, maxFramerate: 30 },
+  med: { name: 'med', maxWidth: 960, fps: 24, maxBitrate: 1_600_000, maxFramerate: 24 },
+  low: { name: 'low', maxWidth: 720, fps: 15, maxBitrate: 900_000, maxFramerate: 15 },
+};
+
+const QUALITY_HYSTERESIS = {
+  // downgrade quickly
+  toLow: { rttMs: 220, loss: 0.030 },
+  toMed: { rttMs: 140, loss: 0.015 },
+  // upgrade conservatively
+  toHigh: { rttMs: 110, loss: 0.010 },
+  toMedUp: { rttMs: 180, loss: 0.025 },
+};
+
+function clamp01(x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
+
+function pickProfile(currentName, rttMs, loss) {
+  const cur = currentName || 'med';
+
+  // Downgrades
+  if (rttMs >= QUALITY_HYSTERESIS.toLow.rttMs || loss >= QUALITY_HYSTERESIS.toLow.loss) return 'low';
+  if (rttMs >= QUALITY_HYSTERESIS.toMed.rttMs || loss >= QUALITY_HYSTERESIS.toMed.loss) return 'med';
+
+  // Upgrades (hysteresis)
+  if (cur === 'low') {
+    // only upgrade out of low when clearly better than the low thresholds
+    if (rttMs <= QUALITY_HYSTERESIS.toMedUp.rttMs && loss <= QUALITY_HYSTERESIS.toMedUp.loss) return 'med';
+    return 'low';
+  }
+  if (cur === 'med') {
+    if (rttMs <= QUALITY_HYSTERESIS.toHigh.rttMs && loss <= QUALITY_HYSTERESIS.toHigh.loss) return 'high';
+    return 'med';
+  }
+  return 'high';
+}
+
+async function readOutboundRttLoss(pc, memo) {
+  // Returns { rttMs, loss } best-effort.
+  // In Chromium-style stats, RTT is often on `remote-inbound-rtp` for the video sender.
+  let rttMs = 0;
+  let loss = 0;
+
+  try {
+    const stats = await pc.getStats();
+    let bestRemote = null;
+    stats.forEach((s) => {
+      if (s.type === 'remote-inbound-rtp' && (s.kind === 'video' || s.mediaType === 'video')) {
+        bestRemote = s;
+      }
+    });
+
+    if (bestRemote) {
+      const rttSec = bestRemote.roundTripTime || bestRemote.totalRoundTripTime;
+      if (typeof rttSec === 'number') rttMs = Math.round(rttSec * 1000);
+
+      // loss estimate using cumulative packetsLost/packetsReceived deltas
+      const lost = Number(bestRemote.packetsLost || 0);
+      const recv = Number(bestRemote.packetsReceived || 0);
+      if (!memo.last) memo.last = { lost, recv };
+      const dLost = Math.max(0, lost - memo.last.lost);
+      const dRecv = Math.max(0, recv - memo.last.recv);
+      const denom = dLost + dRecv;
+      if (denom > 0) loss = clamp01(dLost / denom);
+      memo.last = { lost, recv };
+    }
+  } catch (_) {
+    // ignore
+  }
+
+  return { rttMs, loss };
+}
+
+async function applySenderCaps(sender, profile) {
+  if (!sender || !profile) return;
+  try {
+    const p = sender.getParameters() || {};
+    p.degradationPreference = 'maintain-resolution'; // better text readability for device UIs
+    if (!p.encodings || p.encodings.length === 0) p.encodings = [{}];
+    p.encodings[0].maxBitrate = profile.maxBitrate;
+    p.encodings[0].maxFramerate = profile.maxFramerate;
+    await sender.setParameters(p);
+  } catch (_) {
+    // some builds may throw; safe to ignore
   }
 }
 
@@ -285,6 +423,9 @@ function makeChunkReader() {
 /* ------------ TCP ingest (video) ------------ */
 const TCP_PORT = 9001;
 const tcp = net.createServer((socket) => {
+  // CHANGE (PERF): reduce latency on lossy/long-haul links (avoid Nagle delays)
+  try { socket.setNoDelay(true); } catch (_) { }
+
   let state = 'hello';
   let deviceId = '';
 
@@ -493,6 +634,9 @@ tcp.listen(TCP_PORT, () => log(`TCP ingest :${TCP_PORT}`));
 /* ------------ Control TCP (downstream to Swift) ------------ */
 const CONTROL_PORT = 9002;
 const ctlServer = net.createServer((sock) => {
+  // CHANGE (PERF): reduce latency for control channel (avoid Nagle delays)
+  try { sock.setNoDelay(true); } catch (_) { }
+
   let deviceId = '';
 
   //PERF: chunk reader instead of Buffer.concat
@@ -520,6 +664,7 @@ const ctlServer = net.createServer((sock) => {
       deviceId = idBuf.toString('utf8');
 
       controlSockets.set(deviceId, sock);
+      flushCtl(deviceId);
       log('[ctl] hello from', deviceId, 'ver', ver);
     }
   });
@@ -618,6 +763,17 @@ function ensureAndroidInputInfo(deviceId, serial) {
     return info;
   }
 }
+
+function rotateNorm(x, y, rotationDeg) {
+  // rotation is 0/90/180/270
+  switch ((rotationDeg || 0) % 360) {
+    case 90: return { x: y, y: 1 - x };
+    case 180: return { x: 1 - x, y: 1 - y };
+    case 270: return { x: 1 - y, y: x };
+    default: return { x, y };
+  }
+}
+
 
 
 /**
@@ -906,16 +1062,10 @@ wss.on('connection', (ws) => {
       }
 
       // iOS/Swift path: forward to control TCP socket
-      const sock = controlSockets.get(deviceId);
-      if (!sock) {
-        warn('[ctl] no control socket for', deviceId, '— cannot forward', msg.type);
-        return;
-      }
-      try {
-        const payload = Buffer.from(JSON.stringify(msg), 'utf8');
-        const header = Buffer.allocUnsafe(4);
-        header.writeUInt32BE(payload.length, 0);
-        sock.write(header); sock.write(payload);
+      const ok = sendCtl(deviceId, msg);
+      if (!ok) {
+        warn('[ctl] no control socket for', deviceId, '— queued forward', msg.type);
+      } else {
         log(
           '[ctl] →',
           deviceId,
@@ -926,19 +1076,27 @@ wss.on('connection', (ws) => {
           msg.x && msg.x.toFixed ? msg.x.toFixed(3) : '',
           msg.y && msg.y.toFixed ? msg.y.toFixed(3) : ''
         );
-      } catch (e) {
-        err('[ctl] forward error for', deviceId, e && e.message ? e.message : e);
       }
       return;
     }
 
     if (msg.type === 'iam-viewer') {
+      if (viewer) {
+        // already registered for this WS connection
+        return;
+      }
       const r = room(deviceId);
       const wasEmpty = r.viewers.size === 0;
       ensureSource(r);
 
-      // CHANGE (PERF): enable event-driven pusher (no interval)
-      ensurePusher(r, 24);
+      // CHANGE (PERF): default quality profile (can be auto-adjusted via WebRTC stats)
+      if (!r.qualityState) {
+        r.qualityState = { name: 'med', lastChangeMs: 0 };
+      }
+      const baseProfile = QUALITY_PROFILES[r.qualityState.name] || QUALITY_PROFILES.med;
+
+      // CHANGE (PERF): enable event-driven pusher (no interval); drive cadence by profile.fps
+      ensurePusher(r, baseProfile.fps);
 
       log('[signal] viewer for', deviceId);
 
@@ -954,20 +1112,55 @@ wss.on('connection', (ws) => {
       });
       const stream = new wrtc.MediaStream();
       const sender = pc.addTrack(r.track, stream);
-      if (sender) {
-        const p = sender.getParameters();
-        p.degradationPreference = 'maintain-framerate';
-        p.encodings = [{ maxBitrate: 1_200_000, maxFramerate: 24, priority: 'high' }];
-        try { await sender.setParameters(p); } catch { }
-      }
+      
+      // Create viewer FIRST
+      viewer = { id: uuidv4(), pc, ws };
+      viewer.sender = sender;
+      viewer.statsMemo = {};
+      viewer.qualityTimer = null;
+
+      // Start sender stats AFTER viewer exists (optional, but clean)
+      const statsTimer = startSenderStats(pc, deviceId);
+      viewer.statsTimer = statsTimer;
+
+      r.viewers.add(viewer);
+      // CHANGE (PERF): apply initial sender caps + ask capture agent to match
+      if (sender) await applySenderCaps(sender, baseProfile);
+      sendQuality(deviceId, { fps: baseProfile.fps, maxWidth: baseProfile.maxWidth });
       pc.onicecandidate = (e) => {
         if (e.candidate) {
           ws.send(JSON.stringify({ type: 'ice', deviceId, candidate: e.candidate }));
         }
       };
+      // CHANGE (PERF): adaptive quality loop (per viewer)
+      // Notes:
+      // - This helps long-haul users (India/SF/Boston) by reducing loss + jitter.
+      // - No TURN/SFU required: it simply adapts bitrate/FPS/resolution.
+      const SAMPLE_MS = 2000;
+      const MIN_CHANGE_MS = 8000;
+      viewer.qualityTimer = setInterval(async () => {
+        // viewer might be closed
+        if (!viewer || !viewer.pc) return;
 
-      viewer = { id: uuidv4(), pc, ws };
-      r.viewers.add(viewer);
+        const { rttMs, loss } = await readOutboundRttLoss(viewer.pc, viewer.statsMemo);
+        if (!rttMs && !loss) return;
+
+        const curName = r.qualityState?.name || 'med';
+        const nextName = pickProfile(curName, rttMs, loss);
+
+        // Hysteresis: don't flap
+        const now = Date.now();
+        const lastChange = r.qualityState?.lastChangeMs || 0;
+        if (nextName !== curName && (now - lastChange) >= MIN_CHANGE_MS) {
+          r.qualityState = { name: nextName, lastChangeMs: now };
+          const prof = QUALITY_PROFILES[nextName];
+          log('[qos]', deviceId, `rtt=${rttMs}ms loss=${(loss * 100).toFixed(1)}% → ${nextName} (fps=${prof.fps} w<=${prof.maxWidth})`);
+          if (viewer.sender) await applySenderCaps(viewer.sender, prof);
+          // drive capture + pusher
+          r.fps = prof.fps;
+          sendQuality(deviceId, { fps: prof.fps, maxWidth: prof.maxWidth });
+        }
+      }, SAMPLE_MS);
 
       // CHANGE (CONTROL LOCK): tell this client its viewerId
       try {
@@ -1011,6 +1204,20 @@ wss.on('connection', (ws) => {
     if (!deviceId || !viewer) return;
     const r = room(deviceId);
     try { viewer.pc.close(); } catch { }
+
+    // CHANGE (PERF): stop adaptive quality sampler
+    if (viewer.qualityTimer) {
+      try { clearInterval(viewer.qualityTimer); } catch (_) { }
+      viewer.qualityTimer = null;
+    }
+
+    // ADD: stop sender stats loop (prevents getStats() on closed PC)
+    if (viewer.statsTimer) {
+      try { clearInterval(viewer.statsTimer); } catch (_) { }
+      viewer.statsTimer = null;
+    }
+
+
     r.viewers.delete(viewer);
     log('[signal] viewer closed for', deviceId);
 
@@ -1032,3 +1239,69 @@ const WS_PORT = 8080;
 httpServer.listen(WS_PORT, () => {
   log(`Signal WS :${WS_PORT}  (ws://<ip>:${WS_PORT}/signal)`);
 });
+
+
+function startSenderStats(pc, deviceId) {
+  const memo = {};
+  let stopped = false;
+
+  const timer = setInterval(async () => {
+    if (stopped) return;
+
+    // HARD GUARDS (no crash, no silent death)
+    if (!pc || pc.connectionState === 'closed') {
+      clearInterval(timer);
+      return;
+    }
+
+    try {
+      const { rttMs, loss } = await readOutboundRttLoss(pc, memo);
+
+      if (!Number.isFinite(rttMs)) return;
+
+      const r = room(deviceId);
+      const now = Date.now();
+
+      if (!r.qualityState) {
+        r.qualityState = { name: 'med', lastChangeMs: 0 };
+      }
+
+      // LOG EVERY TIME (temporarily – for debugging)
+      log(
+        `[qos-sender] ${deviceId}`,
+        `rtt=${rttMs}ms`,
+        `loss=${(loss * 100).toFixed(2)}%`,
+        `viewers=${r.viewers.size}`,
+        `profile=${r.qualityState.name}`
+      );
+
+      // Adaptive quality logic
+      if (now - r.qualityState.lastChangeMs > 5000) {
+        const next = pickProfile(r.qualityState.name, rttMs, loss);
+        if (next !== r.qualityState.name) {
+          r.qualityState = { name: next, lastChangeMs: now };
+          const profile = QUALITY_PROFILES[next];
+
+          sendQuality(deviceId, {
+            fps: profile.fps,
+            maxWidth: profile.maxWidth,
+          });
+
+          for (const v of r.viewers) {
+            const sender = v.sender;
+            if (sender) await applySenderCaps(sender, profile);
+          }
+
+          log(`[qos] ${deviceId} → ${next}`);
+        }
+      }
+    } catch (e) {
+      warn('[qos] stats read failed:', e.message);
+    }
+  }, 2000);
+
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+}
