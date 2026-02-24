@@ -28,7 +28,7 @@ const BEZELS = {
 // These are starting values — you can tweak slightly if your bezel PNG has different padding.
 const BEZEL_INSETS_FRAC = {
     pro: { left: 0.060, right: 0.060, top: 0.025, bottom: 0.024 },
-    proMax: { left: 0.045, top: 0.02, right: 0.045, bottom: 0.02 },
+    proMax: { left: 0.045, top: 0.035, right: 0.045, bottom: 0.035 },
 } as const
 
 // Corner radius of the *screen hole* as a fraction of the streamed screen's short edge.
@@ -36,7 +36,7 @@ const BEZEL_INSETS_FRAC = {
 // small square wedges at the corners.
 const SCREEN_CORNER_RADIUS_FRAC = {
     pro: 0.080,
-    proMax: 0.040,
+    proMax: 0.085,
 } as const
 
 function clamp(n: number, lo: number, hi: number) {
@@ -46,6 +46,7 @@ function clamp(n: number, lo: number, hi: number) {
 // You can swap this logic later to use device model from your backend/device list.
 function pickBezelKind(deviceName: string): keyof typeof BEZELS {
     const n = (deviceName || '').toLowerCase()
+    console.log("pick bezel....", n);
     if (n.includes('max')) return 'proMax'
     return 'pro'
 }

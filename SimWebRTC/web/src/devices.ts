@@ -1,14 +1,14 @@
 export const devices = [
   {
     id: 'sim-ios-16-pro',
-    name: 'iOS Simulator #1',
+    name: 'iPhone 16 Pro',
     platform: 'ios',
     windowMatch: 'iPhone 16 Pro',
     bezelKind: 'pro',
   },
   {
     id: 'sim-ios-16-pro-max',
-    name: 'iOS Simulator #2',
+    name: 'iPhone 16 Pro Max',
     platform: 'ios',
     windowMatch: 'iPhone 16 Pro Max',
     bezelKind: 'proMax',

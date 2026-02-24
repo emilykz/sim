@@ -1,7 +1,12 @@
 import SwiftUI
+import QuartzCore
 
 final class AgentApp: ObservableObject {
     @Published var status: String = "idle"
+    @Published var frameWidth: Int = 0
+    @Published var frameHeight: Int = 0
+    @Published var fps: Double = 0
+    @Published var viewerCount: Int = 0
    
     private var signaling: SignalingClient?
     private let webrtc = WebRTCManager()
@@ -14,6 +19,9 @@ final class AgentApp: ObservableObject {
     private var activeWindowMatch: String? = nil
     private var captureStopTask: Task<Void, Never>?
     private let stopGraceSeconds: Double = 15
+    
+    private var fpsFrameCount: Int = 0
+    private var fpsWindowStartTime: CFTimeInterval = CACurrentMediaTime()
 
     init(deviceId: String, hostPort: String) {
         self.deviceId = deviceId
@@ -25,7 +33,33 @@ final class AgentApp: ObservableObject {
         }
 
         capture.onFrame = { [weak self] frame in
-            self?.webrtc.pushFrame(frame)
+            guard let self = self else { return }
+
+            // --- Resolution metrics ---
+            let w = Int(frame.width)
+            let h = Int(frame.height)
+            if w != self.frameWidth || h != self.frameHeight {
+                DispatchQueue.main.async {
+                    self.frameWidth = w
+                    self.frameHeight = h
+                }
+            }
+
+            // --- FPS metrics (approx over a ~1s window) ---
+            self.fpsFrameCount += 1
+            let now = CACurrentMediaTime()
+            let elapsed = now - self.fpsWindowStartTime
+            if elapsed >= 1.0 {
+                let fps = Double(self.fpsFrameCount) / elapsed
+                self.fpsFrameCount = 0
+                self.fpsWindowStartTime = now
+                DispatchQueue.main.async {
+                    self.fps = fps
+                }
+            }
+
+            // Forward the frame into WebRTC
+            self.webrtc.pushFrame(frame)
         }
 
         webrtc.onAnswer = { [weak self] viewerId, sdp in
@@ -55,6 +89,15 @@ final class AgentApp: ObservableObject {
             "type": "iam-agent",
             "deviceId": deviceId
         ])
+    }
+    
+    private func refreshViewerCount() {
+        let n = webrtc.viewerCount()
+        if n != viewerCount {
+            DispatchQueue.main.async { [weak self] in
+                self?.viewerCount = n
+            }
+        }
     }
 
     private func handle(msg: [String: Any]) {
@@ -91,6 +134,7 @@ final class AgentApp: ObservableObject {
             }
 
             webrtc.handleOffer(viewerId: viewerId, sdp: sdp)
+            refreshViewerCount()
 
         case "ice":
             guard let viewerId = msg["viewerId"] as? String,
@@ -102,6 +146,7 @@ final class AgentApp: ObservableObject {
             guard let viewerId = msg["viewerId"] as? String else { return }
             print("👋 viewer left viewerId=\(viewerId)")
             webrtc.removeViewer(viewerId)
+            refreshViewerCount()
 
             if webrtc.viewerCount() == 0 {
                 captureStopTask?.cancel()
@@ -162,20 +207,99 @@ final class AgentApp: ObservableObject {
     }
 }
 
-struct ContentView: View {
-    // Agent ID should match one entry in devices.ts
-    @StateObject private var app = AgentApp(deviceId: "sim-ios-16-pro",
-                                           hostPort: "192.168.86.25:8080")
+// Simple config describing each device this host serves.
+struct DeviceConfig: Identifiable {
+    let id: String      // MUST match device.id in devices.ts / server side
+    let label: String   // Human-friendly name
+
+    var deviceId: String { id }
+}
+
+struct DeviceRowView: View {
+    let config: DeviceConfig
+    let hostPort: String
+
+    // Each row owns its own AgentApp for that deviceId
+    @StateObject private var app: AgentApp
+
+    init(config: DeviceConfig, hostPort: String) {
+        self.config = config
+        self.hostPort = hostPort
+        _app = StateObject(
+            wrappedValue: AgentApp(
+                deviceId: config.id,
+                hostPort: hostPort
+            )
+        )
+    }
 
     var body: some View {
-        VStack(spacing: 12) {
-            Text("SimWebRTCStreamer").font(.title2)
-            Text("status: \(app.status)")
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(config.label)
+                    .font(.headline)
+                Text("deviceId: \(config.id)")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+
+            Spacer()
+
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(app.status)
+                    .font(.subheadline)
+
+                Text("\(app.viewerCount) viewer\(app.viewerCount == 1 ? "" : "s")")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                if app.frameWidth > 0 && app.frameHeight > 0 {
+                    Text("\(app.frameWidth)x\(app.frameHeight)")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    Text(String(format: "%.1f fps", app.fps))
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                } else {
+                    Text("no signal")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
         }
-        .padding(20)
-        .frame(minWidth: 360, minHeight: 200)
+        .padding(.vertical, 4)
     }
 }
 
+struct ContentView: View {
+    // Signaling host:port for THIS Mac
+    private let hostPort = "30.135.221.144:8080" // adjust if needed
 
+    // ⚠️ IMPORTANT:
+    // These deviceIds MUST match what your web client / server uses
+    // for this host (see devices.ts on the Node side).
+    private let devices: [DeviceConfig] = [
+        DeviceConfig(id: "sim-ios-16-pro",     label: "iPhone 16 Pro (sim)"),
+        DeviceConfig(id: "sim-ios-16-pro-max", label: "iPhone 16 Pro Max (sim)"),
+        DeviceConfig(id: "sim-android-1",      label: "Android Emulator #1"),
+        DeviceConfig(id: "sim-android-2",      label: "Android Emulator #2"),
+    ]
 
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("SimWebRTCStreamer")
+                .font(.title2)
+
+            Text("Devices on this host")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+
+            List(devices) { cfg in
+                DeviceRowView(config: cfg, hostPort: hostPort)
+            }
+            .listStyle(.plain)
+        }
+        .padding(20)
+        .frame(minWidth: 450, minHeight: 280)
+    }
+}

@@ -138,7 +138,7 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     // ✅ This matches ContentView.swift
-    func startCapture(platform: Platform, windowMatch: String?, fps: Int = 30, maxLongEdgePixels: Int? = 1280, cropTopPoints: CGFloat = 50, fixedOutputWidthPx: Int? = nil, fixedOutputHeightPx: Int? = nil) async throws {
+    func startCapture(platform: Platform, windowMatch: String?, fps: Int = 30, maxLongEdgePixels: Int? = 1600, cropTopPoints: CGFloat = 50, fixedOutputWidthPx: Int? = nil, fixedOutputHeightPx: Int? = nil) async throws {
         self.cfg = (platform: platform, windowMatch: windowMatch)
         self.didLogFirstFrame = false
         self.frameCount = 0
