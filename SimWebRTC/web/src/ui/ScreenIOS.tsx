@@ -275,12 +275,96 @@ export default function ScreenIOS() {
 
         console.log('WS url', SIGNAL_URL)
         let wsAttempt = 0
+
+        // ---- PATCH: prevent ghost viewers on tab close/unmount ----
+        let disposed = false
+        let intentionalClose = false
+        let reconnectTimer: any = null
+
         const makeWs = () => {
             const w = new WebSocket(SIGNAL_URL)
             wsRef.current = w
             return w
         }
         let ws = makeWs()
+
+        const scheduleReconnect = () => {
+            if (disposed || intentionalClose) return
+
+            const wait = Math.min(15000, 300 * Math.pow(2, wsAttempt++)) + Math.random() * 250
+            console.warn(`[ws] closed; reconnecting in ${Math.round(wait)}ms`)
+
+            if (reconnectTimer) clearTimeout(reconnectTimer)
+
+            reconnectTimer = window.setTimeout(() => {
+                if (disposed || intentionalClose) return
+                ws = makeWs()
+                bindWsHandlers(ws)
+            }, wait)
+        }
+
+        const bindWsHandlers = (sock: WebSocket) => {
+            sock.onopen = async () => {
+                wsAttempt = 0
+                sock.send(JSON.stringify({ type: 'iam-viewer', deviceId: device.id }))
+                const tx = pc.addTransceiver('video', { direction: 'recvonly' })
+                preferH264OnTransceiver(pc, tx)
+                // ✅ wait for server to send viewer-id before creating offer
+            }
+
+            sock.onmessage = async (event) => {
+                const msg: any = JSON.parse(event.data)
+
+                if (msg.type === 'answer' && msg.deviceId === device.id) {
+                    await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp })
+                } else if (msg.type === 'ice' && msg.deviceId === device.id && msg.candidate) {
+                    try {
+                        await pc.addIceCandidate(msg.candidate)
+                    } catch { }
+                } else if (msg.type === 'viewer-id' && msg.deviceId === device.id) {
+                    setViewerId(msg.viewerId)
+
+                    if (!offerSentRef.current) {
+                        offerSentRef.current = true
+
+                        const offer = await pc.createOffer()
+                        await pc.setLocalDescription(offer)
+
+                        tOfferSent = performance.now()
+                        sock.send(
+                            JSON.stringify({
+                                type: 'offer',
+                                deviceId: device.id,
+                                viewerId: msg.viewerId,
+                                sdp: offer.sdp,
+                                deviceInfo: {
+                                    platform: device.platform,
+                                    windowMatch: device.windowMatch,
+                                    id: device.id,
+                                    name: device.name,
+                                },
+                            })
+                        )
+                    }
+                } else if (msg.type === 'control-state' && msg.deviceId === device.id) {
+                    setControllerId(msg.controllerId || null)
+                } else if (msg.type === 'control-denied' && msg.deviceId === device.id) {
+                    setControllerId(msg.controllerId || null)
+                }
+            }
+
+            sock.onerror = () => {
+                try { sock.close() } catch { }
+            }
+
+            sock.onclose = () => {
+                if (disposed || intentionalClose) return
+                scheduleReconnect()
+            }
+        }
+
+        // Bind handlers for initial WebSocket
+        bindWsHandlers(ws)
 
         // P2P control channel (removes VA/TX signaling latency from input when connected)
         const dc = pc.createDataChannel('control', { ordered: true })
@@ -343,7 +427,7 @@ export default function ScreenIOS() {
                 const candidatesById: Record<string, any> = {}
                 let selectedPair: any = null
                 let foundAny = false
-    
+
                 stats.forEach((r: any) => {
                     if (r.type === 'local-candidate' || r.type === 'remote-candidate') {
                         candidatesById[r.id] = r
@@ -357,7 +441,7 @@ export default function ScreenIOS() {
                         // console.log('[inbound video]', r.bytesReceived, r.framesDecoded)
                     }
                 })
-    
+
                 if (!foundAny) {
                     const types = new Set<string>()
                     stats.forEach((r: any) => types.add(`${r.type}:${r.kind || r.mediaType || ''}`))
@@ -367,116 +451,6 @@ export default function ScreenIOS() {
                 console.warn('[stats] getStats failed', e)
             }
         }, 1000)
-
-        ws.onopen = async () => {
-            wsAttempt = 0
-            ws.send(JSON.stringify({ type: 'iam-viewer', deviceId: device.id }))
-            const tx = pc.addTransceiver('video', { direction: 'recvonly' })
-            preferH264OnTransceiver(pc, tx)
-            // ✅ wait for server to send viewer-id before creating offer
-        }
-
-        ws.onclose = () => {
-            const wait = Math.min(15000, 300 * Math.pow(2, wsAttempt++)) + Math.random() * 250
-            console.warn(`[ws] closed; reconnecting in ${Math.round(wait)}ms`)
-            window.setTimeout(() => {
-                // swap ws reference and re-bind handlers (minimal disruption)
-                ws = makeWs()
-                // re-bind handlers by re-running the same assignments
-                // NOTE: we intentionally do NOT recreate the PC here; reconnect is for signaling resiliency.
-                ws.onopen = async () => {
-                    wsAttempt = 0
-                    ws.send(JSON.stringify({ type: 'iam-viewer', deviceId: device.id }))
-                }
-                ws.onmessage = async (event) => {
-                    let msg: any
-                    msg = JSON.parse(event.data)
-
-                    if (msg.type === 'answer' && msg.deviceId === device.id) {
-                        await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp })
-                    } else if (msg.type === 'ice' && msg.deviceId === device.id && msg.candidate) {
-                        try {
-                            await pc.addIceCandidate(msg.candidate)
-                        } catch { }
-                    } else if (msg.type === 'viewer-id' && msg.deviceId === device.id) {
-                        setViewerId(msg.viewerId)
-
-                        if (!offerSentRef.current) {
-                            offerSentRef.current = true
-
-                            const offer = await pc.createOffer()
-                            await pc.setLocalDescription(offer)
-
-                            tOfferSent = performance.now()
-                            ws.send(
-                                JSON.stringify({
-                                    type: 'offer',
-                                    deviceId: device.id,
-                                    viewerId: msg.viewerId,
-                                    sdp: offer.sdp,
-                                    deviceInfo: {
-                                        platform: device.platform,
-                                        windowMatch: device.windowMatch,
-                                        id: device.id,
-                                        name: device.name,
-                                    },
-                                })
-                            )
-                        }
-                    } else if (msg.type === 'control-state' && msg.deviceId === device.id) {
-                        setControllerId(msg.controllerId || null)
-                    } else if (msg.type === 'control-denied' && msg.deviceId === device.id) {
-                        setControllerId(msg.controllerId || null)
-                    }
-                }
-
-                ws.onerror = () => {
-                    try { ws.close() } catch { }
-                }
-            }, wait)
-        }
-
-        ws.onmessage = async (event) => {
-            let msg: any
-            msg = JSON.parse(event.data)
-
-            if (msg.type === 'answer' && msg.deviceId === device.id) {
-                await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp })
-            } else if (msg.type === 'ice' && msg.deviceId === device.id && msg.candidate) {
-                try {
-                    await pc.addIceCandidate(msg.candidate)
-                } catch { }
-            } else if (msg.type === 'viewer-id' && msg.deviceId === device.id) {
-                setViewerId(msg.viewerId)
-
-                if (!offerSentRef.current) {
-                    offerSentRef.current = true
-
-                    const offer = await pc.createOffer()
-                    await pc.setLocalDescription(offer)
-
-                    tOfferSent = performance.now()
-                    ws.send(
-                        JSON.stringify({
-                            type: 'offer',
-                            deviceId: device.id,
-                            viewerId: msg.viewerId,
-                            sdp: offer.sdp,
-                            deviceInfo: {
-                                platform: device.platform,
-                                windowMatch: device.windowMatch,
-                                id: device.id,
-                                name: device.name,
-                            },
-                        })
-                    )
-                }
-            } else if (msg.type === 'control-state' && msg.deviceId === device.id) {
-                setControllerId(msg.controllerId || null)
-            } else if (msg.type === 'control-denied' && msg.deviceId === device.id) {
-                setControllerId(msg.controllerId || null)
-            }
-        }
 
         pc.onicecandidate = (event) => {
             if (!event.candidate) return
@@ -491,7 +465,9 @@ export default function ScreenIOS() {
             // ✅ include viewerId once known
             if (viewerIdRef.current) payload.viewerId = viewerIdRef.current
 
-            ws.send(JSON.stringify(payload))
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(payload))
+            }
         }
 
         // pointer → WS (normalized)
@@ -627,7 +603,21 @@ export default function ScreenIOS() {
         }
 
         const onKeyUp = (e: KeyboardEvent) => {
-            sendControl({ type: 'key', deviceId: device.id, action: 'up', code: e.code, key: e.key })
+            // If it's a printable character, we already sent a "text" event on keydown.
+            // No need to also send a key-up event for simple typing.
+            if (e.key.length === 1 && !e.metaKey) {
+                e.preventDefault()
+                return
+            }
+        
+            // For control/navigation keys, still send key-up
+            sendControl({
+                type: 'key',
+                deviceId: device.id,
+                action: 'up',
+                code: e.code,
+                key: e.key,
+            })
             e.preventDefault()
         }
 
@@ -725,6 +715,22 @@ export default function ScreenIOS() {
             host.removeEventListener('keydown', onKeyDown)
             host.removeEventListener('keyup', onKeyUp)
 
+            // ---- PATCH: prevent ws.onclose from scheduling reconnect during unmount ----
+            disposed = true
+            intentionalClose = true
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer)
+                reconnectTimer = null
+            }
+
+            // optional but recommended: remove handlers so nothing fires during teardown
+            try {
+                ws.onopen = null
+                ws.onmessage = null
+                ws.onclose = null
+                ws.onerror = null
+            } catch { }
+
             try { ws.close() } catch { }
             try { pc.close() } catch { }
 
@@ -753,23 +759,23 @@ export default function ScreenIOS() {
         }
     }, [bezelNatural, computeFrame, applyLayout])
 
-    
 
-function preferH264OnTransceiver(pc: RTCPeerConnection, transceiver: RTCRtpTransceiver) {
-    const caps = (RTCRtpReceiver as any).getCapabilities?.('video')
-    if (!caps?.codecs?.length) return
-    const codecs = caps.codecs as RTCRtpCodecCapability[]
-    const h264 = codecs.filter((c) => (c.mimeType || '').toLowerCase() === 'video/h264')
-    const rest = codecs.filter((c) => (c.mimeType || '').toLowerCase() !== 'video/h264')
-    const ordered = [...h264, ...rest]
-    try {
-        transceiver.setCodecPreferences(ordered as any)
-        console.log('[codec] prefer H264; h264Count=', h264.length)
-    } catch (e) {
-        console.warn('[codec] setCodecPreferences failed (ok):', e)
+
+    function preferH264OnTransceiver(pc: RTCPeerConnection, transceiver: RTCRtpTransceiver) {
+        const caps = (RTCRtpReceiver as any).getCapabilities?.('video')
+        if (!caps?.codecs?.length) return
+        const codecs = caps.codecs as RTCRtpCodecCapability[]
+        const h264 = codecs.filter((c) => (c.mimeType || '').toLowerCase() === 'video/h264')
+        const rest = codecs.filter((c) => (c.mimeType || '').toLowerCase() !== 'video/h264')
+        const ordered = [...h264, ...rest]
+        try {
+            transceiver.setCodecPreferences(ordered as any)
+            console.log('[codec] prefer H264; h264Count=', h264.length)
+        } catch (e) {
+            console.warn('[codec] setCodecPreferences failed (ok):', e)
+        }
     }
-}
-type QoS = {
+    type QoS = {
         rttMs?: number
         jitterMs?: number
         lossPct?: number
@@ -847,15 +853,15 @@ type QoS = {
 
             const ice = selectedPair
                 ? (() => {
-                      const local = candidatesById[selectedPair.localCandidateId]
-                      const remote = candidatesById[selectedPair.remoteCandidateId]
-                      return {
-                          localType: local?.candidateType,
-                          localProto: local?.protocol,
-                          remoteType: remote?.candidateType,
-                          remoteProto: remote?.protocol,
-                      }
-                  })()
+                    const local = candidatesById[selectedPair.localCandidateId]
+                    const remote = candidatesById[selectedPair.remoteCandidateId]
+                    return {
+                        localType: local?.candidateType,
+                        localProto: local?.protocol,
+                        remoteType: remote?.candidateType,
+                        remoteProto: remote?.protocol,
+                    }
+                })()
                 : undefined
 
             onSample?.(qos, ice)

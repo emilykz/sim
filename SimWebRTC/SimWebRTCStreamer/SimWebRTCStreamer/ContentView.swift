@@ -15,6 +15,9 @@ final class AgentApp: ObservableObject {
     private let deviceId: String
     private let hostPort: String  // e.g. "192.168.86.21:8080"
 
+    // Which viewer currently has control for this device (as decided by server.js)
+    private var currentControllerId: String? = nil
+    
     private var isCapturing = false
     private var activeWindowMatch: String? = nil
     private var captureStopTask: Task<Void, Never>?
@@ -83,6 +86,22 @@ final class AgentApp: ObservableObject {
                 ]
             ])
         }
+        
+        // Data-channel control path: viewer input (pointer / key / text) arrives here.
+        webrtc.onControlMessage = { [weak self] viewerId, text in
+            guard let self else { return }
+
+            // Data channel carries the same JSON objects we send over WebSocket from the browser.
+            guard let data = text.data(using: .utf8),
+                  let anyObj = try? JSONSerialization.jsonObject(with: data, options: []),
+                  let obj = anyObj as? [String: Any] else {
+                print("[control] ⚠️ could not decode control JSON from viewerId=\(viewerId)")
+                return
+            }
+
+            self.handleControlPayload(viewerId: viewerId, payload: obj)
+        }
+        
 
         signaling?.connect()
         signaling?.send([
@@ -140,7 +159,17 @@ final class AgentApp: ObservableObject {
             guard let viewerId = msg["viewerId"] as? String,
                   let cand = msg["candidate"] as? [String: Any] else { return }
             webrtc.addIce(viewerId: viewerId, cand: cand)
+        case "control-state":
+            // Server telling us who currently owns control for this device.
+            let controllerId = msg["controllerId"] as? String
+            currentControllerId = controllerId
+            print("[agent] control-state deviceId=\(deviceId) controllerId=\(controllerId ?? "nil")")
 
+        case "pointer", "key", "text":
+            // Control messages routed over the /agent WebSocket path (fallback when data channel is not used).
+            let viewerId = msg["viewerId"] as? String ?? "<ws-no-viewer-id>"
+            handleControlPayload(viewerId: viewerId, payload: msg)
+            
         case "viewer-left":
             // server.js sends "viewer-left"
             guard let viewerId = msg["viewerId"] as? String else { return }
@@ -164,6 +193,50 @@ final class AgentApp: ObservableObject {
                     }
                 }
             }
+
+        default:
+            break
+        }
+    }
+    
+    
+    /// Unified handler for all control messages coming from viewers.
+    /// - Parameters:
+    ///   - viewerId: which viewer sent the event
+    ///   - payload: JSON dictionary (same shape for WS + data channel)
+    private func handleControlPayload(viewerId: String, payload: [String: Any]) {
+        guard let type = payload["type"] as? String else { return }
+
+        // Optional safety: ignore input from non-controller viewers.
+        if let ctrl = currentControllerId, ctrl != viewerId {
+            print("[control] ignored from non-controller viewerId=\(viewerId) type=\(type) currentController=\(ctrl)")
+            return
+        }
+
+        switch type {
+        case "pointer":
+            let x = payload["x"] as? Double ?? -1
+            let y = payload["y"] as? Double ?? -1
+            let kind = payload["kind"] as? String ?? "?"
+            let buttons = payload["buttons"] as? Int ?? 0
+            print("[control] pointer viewerId=\(viewerId) kind=\(kind) x=\(x) y=\(y) buttons=\(buttons)")
+
+            // TODO: Here is where we’ll map normalized x/y to sim/em coordinates
+            // and call into WDA (for iOS) or adb (for Android).
+
+        case "key":
+            let action = payload["action"] as? String ?? "?"
+            let code = payload["code"] as? String ?? "?"
+            let key = payload["key"] as? String ?? "?"
+            print("[control] key viewerId=\(viewerId) action=\(action) code=\(code) key=\(key)")
+
+            // TODO: Hook to WDA/adb key events.
+
+        case "text":
+            let text = payload["text"] as? String ?? ""
+            print("[control] text viewerId=\(viewerId) \(text.debugDescription)")
+
+            // TODO: send text into focused element via WDA/adb.
 
         default:
             break
@@ -273,7 +346,7 @@ struct DeviceRowView: View {
 
 struct ContentView: View {
     // Signaling host:port for THIS Mac
-    private let hostPort = "30.135.221.144:8080" // adjust if needed
+    private let hostPort = "192.168.86.25:8080" // adjust if needed
 
     // ⚠️ IMPORTANT:
     // These deviceIds MUST match what your web client / server uses

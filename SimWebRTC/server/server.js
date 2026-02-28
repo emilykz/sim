@@ -18,6 +18,44 @@ const viewersByDevice = new Map();
 // viewer ws -> { deviceId, viewerId, lastSeenMs }
 const viewerMeta = new Map();
 
+// deviceId -> current controller viewerId (or null)
+const controllerByDevice = new Map();
+
+// Broadcast a message to all viewers on a device
+function broadcastToViewers(deviceId, msg) {
+  const m = viewersByDevice.get(deviceId);
+  if (!m) return;
+  for (const vws of m.values()) {
+    send(vws, msg);
+  }
+}
+
+function getController(deviceId) {
+  const id = controllerByDevice.get(deviceId);
+  return id ?? null;
+}
+
+function setController(deviceId, viewerIdOrNull) {
+  if (!deviceId) return;
+
+  if (viewerIdOrNull) {
+    controllerByDevice.set(deviceId, viewerIdOrNull);
+  } else {
+    controllerByDevice.delete(deviceId);
+  }
+
+  const controllerId = viewerIdOrNull ?? null;
+
+  // Notify all viewers so they can update their "canInteract" UI
+  broadcastToViewers(deviceId, { type: "control-state", deviceId, controllerId });
+
+  // Also notify the agent so it can enforce control server-side if desired
+  const agent = agents.get(deviceId);
+  if (agent) {
+    send(agent, { type: "control-state", deviceId, controllerId });
+  }
+}
+
 function markAlive(ws) { ws.isAlive = true; }
 
 function send(ws, obj) {
@@ -61,13 +99,19 @@ function detachViewer(deviceId, viewerId, reason = "") {
     if (m.size === 0) viewersByDevice.delete(deviceId);
   }
 
+  // If this viewer was the current controller, clear controller for this device.
+  if (getController(deviceId) === viewerId) {
+    setController(deviceId, null);   // ✅ your “controller = null on disconnect” requirement
+  }
+
   const agent = agents.get(deviceId);
   if (agent) {
-    console.log("[route] viewer-left -> agent", "deviceId=", deviceId, "viewerId=", viewerId, reason ? `reason=${reason}` : "");
+    console.log("[route] viewer-left -> agent", { deviceId, viewerId, reason });
     send(agent, { type: "viewer-left", deviceId, viewerId, reason });
     notifyViewerCount(deviceId);
   }
 }
+
 
 const httpServer = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
@@ -136,22 +180,33 @@ wssViewers.on("connection", (ws, req) => {
     if (msg.type === "iam-viewer") {
       deviceId = msg.deviceId;
       viewerId = msg.viewerId ?? crypto.randomUUID();
-
+    
       const m = getViewersMap(deviceId);
       m.set(viewerId, ws);
-
+    
       ws._viewerDetached = false;
       viewerMeta.set(ws, { deviceId, viewerId, lastSeenMs: Date.now() });
-
+    
       send(ws, { type: "viewer-id", deviceId, viewerId });
       send(ws, { type: "agent-state", deviceId, online: agents.has(deviceId) });
-
+    
       // Server-owned viewer-count (push to agent). Agent can use this to start/stop capture.
       notifyViewerCount(deviceId);
-
+    
+      // Controller semantics:
+      // - If no controller yet, first viewer becomes controller.
+      // - Otherwise, just send the current controller snapshot to this viewer.
+      const current = getController(deviceId);
+      if (!current) {
+        setController(deviceId, viewerId);
+      } else {
+        send(ws, { type: "control-state", deviceId, controllerId: current });
+      }
+    
       console.log("[viewer] registered", { deviceId, viewerId });
       return;
     }
+      
 
     if (!deviceId) deviceId = msg.deviceId;
 
