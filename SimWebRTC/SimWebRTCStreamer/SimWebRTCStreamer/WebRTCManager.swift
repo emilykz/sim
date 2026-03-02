@@ -38,6 +38,8 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
     private struct VideoTuneState {
         var maxBitrateBps: Int
         var maxFramerate: Int
+        var baselineMaxBitrateBps: Int
+        var baselineMaxFramerate: Int
         var lastGoodTs: TimeInterval = 0
         var lastBadTs: TimeInterval = 0
         var lastBytesSent: Int64 = 0
@@ -45,6 +47,12 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
         var lastPacketsLost: Int64 = 0
     }
     private var tuneByViewer: [String: VideoTuneState] = [:]
+
+    // Interaction-aware mode (for smooth scroll vs. sharp idle)
+    private var interactionActive: Bool = false
+    private var interactionTimer: DispatchSourceTimer?
+    private let interactionHoldSeconds: TimeInterval = 0.9
+    private let interactionQueue = DispatchQueue(label: "webrtc.interaction.q")
 
     // Local media (VideoSource is a “fake capturer” we push frames into)
     private let capturer = DummyCapturer()
@@ -102,13 +110,35 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
         RTCCleanupSSL()
     }
 
-    // MARK: - Public API expected by ContentView.swift
+        // Last pushed frame dimensions (used to pick sane default bitrate caps)
+    private var lastFrameWidth: Int = 0
+    private var lastFrameHeight: Int = 0
+
+    /// Choose a sensible baseline max bitrate for screen content based on resolution.
+    /// These are intentionally higher than camera defaults because UI text needs bits during scroll.
+    private func defaultBaselineMaxBitrateBps() -> Int {
+        let w = max(1, lastFrameWidth)
+        let h = max(1, lastFrameHeight)
+        let pixels = w * h
+
+        // ~720p
+        if pixels <= 1_000_000 { return 6_000_000 }      // 6 Mbps
+        // ~1080p
+        if pixels <= 2_200_000 { return 10_000_000 }     // 10 Mbps
+        // tall iPhone sim (~1300x2796 ~= 3.6M px)
+        if pixels <= 4_200_000 { return 14_000_000 }     // 14 Mbps
+        return 18_000_000                               // very high res
+    }
+// MARK: - Public API expected by ContentView.swift
 
     func viewerCount() -> Int { pcs.count }
 
     func removeViewer(_ viewerId: String) {
         close(viewerId: viewerId)
+        // Re-evaluate tuning for remaining viewers when one disconnects.
+        retuneForViewerCountChange()
     }
+
 
     /// Called by your ScreenCapture pipeline.
     func pushFrame(_ frame: RTCVideoFrame) {
@@ -126,6 +156,61 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
 
         localVideoSource.capturer(capturer, didCapture: frame)
     }
+    /// Called whenever a user interacts (pointer/key/text).
+    /// Temporarily bias encoder toward smooth motion, then snap back to sharp idle.
+    func noteInteraction() {
+        interactionQueue.async { [weak self] in
+            guard let self else { return }
+
+            self.interactionActive = true
+
+            // Re-apply current tuning so degradationPreference switches to maintainFramerate.
+            for (viewerId, pc) in self.pcs {
+                if let state = self.tuneByViewer[viewerId] {
+                    self.applyTune(viewerId: viewerId,
+                                   pc: pc,
+                                   maxBitrateBps: state.maxBitrateBps,
+                                   maxFramerate: state.maxFramerate)
+                }
+            }
+
+            self.interactionTimer?.cancel()
+            self.interactionTimer = nil
+
+            let t = DispatchSource.makeTimerSource(queue: self.interactionQueue)
+            t.schedule(deadline: .now() + self.interactionHoldSeconds)
+            t.setEventHandler { [weak self] in
+                guard let self else { return }
+                self.interactionActive = false
+                self.interactionTimer?.cancel()
+                self.interactionTimer = nil
+                self.forceIdleSharpen()
+            }
+            t.resume()
+            self.interactionTimer = t
+        }
+    }
+
+    /// After a short idle period, restore crisp text by snapping back to baseline bitrate/fps
+    /// and switching degradationPreference to maintainResolution.
+    private func forceIdleSharpen() {
+        print("[agent][idle] no interaction → sharpening all senders")
+
+        for (viewerId, pc) in pcs {
+            guard var state = tuneByViewer[viewerId] else { continue }
+
+            state.maxBitrateBps = state.baselineMaxBitrateBps
+            state.maxFramerate = state.baselineMaxFramerate
+            tuneByViewer[viewerId] = state
+
+            applyTune(viewerId: viewerId,
+                      pc: pc,
+                      maxBitrateBps: state.maxBitrateBps,
+                      maxFramerate: state.maxFramerate)
+        }
+    }
+
+
 
     /// Tune video senders for **WAN P2P UI testing**:
     /// - Prioritize sharp text (maintain resolution)
@@ -146,7 +231,8 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
         } else if longEdge <= 1920 {
             targetBitrate = 5_500_000
         } else {
-            targetBitrate = 6_500_000
+            // Tall iPhone sims (e.g., 1300x2796) need more headroom to stay sharp during fast scroll.
+            targetBitrate = 12_000_000
         }
         let targetFps = 30
 
@@ -332,7 +418,9 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
         }
 
         if let sender = pc.add(localVideoTrack, streamIds: ["stream"]) {
-            tuneVideoSender(sender, viewerId: viewerId)
+            // Pick a sane baseline bitrate for screen content based on the capture resolution.
+            let base = defaultBaselineMaxBitrateBps()
+            tuneVideoSender(sender, viewerId: viewerId, maxBitrateBps: base, maxFramerate: 24)
         }
 
         print("✅ [agent] bound local video using pc.add(track, streamIds:[\"stream\"]) viewerId=\(viewerId)")
@@ -418,7 +506,8 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
         if let old = statsTimers[viewerId] { old.cancel() }
 
         if tuneByViewer[viewerId] == nil {
-            tuneByViewer[viewerId] = VideoTuneState(maxBitrateBps: 3_500_000, maxFramerate: 30)
+            let base = defaultBaselineMaxBitrateBps()
+            tuneByViewer[viewerId] = VideoTuneState(maxBitrateBps: base, maxFramerate: 24, baselineMaxBitrateBps: base, baselineMaxFramerate: 24)
         }
 
         let q = DispatchQueue(label: "webrtc.stats.\(viewerId)")
@@ -471,7 +560,10 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
                     return
                 }
 
-                var state = self.tuneByViewer[viewerId] ?? VideoTuneState(maxBitrateBps: 3_500_000, maxFramerate: 30)
+                var state = self.tuneByViewer[viewerId] ?? {
+                    let base = self.defaultBaselineMaxBitrateBps()
+                    return VideoTuneState(maxBitrateBps: base, maxFramerate: 24, baselineMaxBitrateBps: base, baselineMaxFramerate: 24)
+                }()
                 let dBytes = max<Int64>(0, bytes - state.lastBytesSent)
                 let bitrateBps = Double(dBytes) * 8.0
                 state.lastBytesSent = bytes
@@ -487,7 +579,7 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
                 let now = CACurrentMediaTime()
 
                 let rttMs = (rttSec ?? 0) * 1000.0
-                let isBad = (rttMs > 250.0) || (lossRate > 0.02) || (bitrateBps < Double(state.maxBitrateBps) * 0.55)
+                let isBad = (rttMs > 300.0) || (lossRate > 0.05)
 
                 if isBad {
                     state.lastBadTs = now
@@ -495,33 +587,45 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
                     state.lastGoodTs = now
                 }
 
-                if now - state.lastBadTs < 3.0 {
-                    // grace window
-                } else if isBad {
-                    if state.maxFramerate > 20 {
-                        state.maxFramerate = 20
-                        self.applyTune(viewerId: viewerId, pc: pc, maxBitrateBps: state.maxBitrateBps, maxFramerate: state.maxFramerate)
-                        print("[agent][adapt] viewer=\(viewerId) BAD → fps 20 (keep res for readability)")
-                    } else if state.maxBitrateBps > 2_500_000 {
-                        state.maxBitrateBps = 2_500_000
-                        self.applyTune(viewerId: viewerId, pc: pc, maxBitrateBps: state.maxBitrateBps, maxFramerate: state.maxFramerate)
-                        print("[agent][adapt] viewer=\(viewerId) BAD → cap 2.5Mbps")
-                    } else if state.maxBitrateBps > 2_000_000 {
-                        state.maxBitrateBps = 2_000_000
-                        self.applyTune(viewerId: viewerId, pc: pc, maxBitrateBps: state.maxBitrateBps, maxFramerate: state.maxFramerate)
-                        print("[agent][adapt] viewer=\(viewerId) BAD → cap 2.0Mbps")
+                // Adaptation policy:
+                // - Never permanently clamp the sender to a low Mbps ceiling (that causes “stuck blurry” UI).
+                // - Use baselineMaxBitrateBps as the recovery target.
+                // - On genuinely bad network (high RTT/loss), step down conservatively and recover quickly.
+
+                let baseBitrate = max(3_500_000, state.baselineMaxBitrateBps)
+                let minBitrate = max(3_500_000, Int(Double(baseBitrate) * 0.60)) // don’t go below 60% of baseline
+                let maxBitrate = baseBitrate
+
+                if isBad {
+                    // Only react if we are in sustained “bad” (avoid flapping)
+                    if now - state.lastBadTs < 3.0 {
+                        // grace window (do nothing)
+                    } else {
+                        // Prefer dropping framerate a bit first; only then drop bitrate.
+                        if state.maxFramerate > 24 {
+                            state.maxFramerate = 24
+                            self.applyTune(viewerId: viewerId, pc: pc, maxBitrateBps: state.maxBitrateBps, maxFramerate: state.maxFramerate)
+                            print("[agent][adapt] viewer=\(viewerId) BAD → fps 24")
+                        } else if state.maxBitrateBps > minBitrate {
+                            // step down 10% at a time
+                            state.maxBitrateBps = max(minBitrate, Int(Double(state.maxBitrateBps) * 0.90))
+                            self.applyTune(viewerId: viewerId, pc: pc, maxBitrateBps: state.maxBitrateBps, maxFramerate: state.maxFramerate)
+                            print(String(format: "[agent][adapt] viewer=%@ BAD → cap %.2fMbps", viewerId, Double(state.maxBitrateBps)/1_000_000.0))
+                        }
                     }
                 } else {
+                    // Good network: recover quickly toward baseline
                     let goodFor = now - state.lastGoodTs
-                    if goodFor > 10.0 {
-                        if state.maxFramerate < 30 {
-                            state.maxFramerate = 30
+                    if goodFor > 1.5 {
+                        if state.maxFramerate < state.baselineMaxFramerate {
+                            state.maxFramerate = state.baselineMaxFramerate
                             self.applyTune(viewerId: viewerId, pc: pc, maxBitrateBps: state.maxBitrateBps, maxFramerate: state.maxFramerate)
-                            print("[agent][adapt] viewer=\(viewerId) GOOD → fps 30")
-                        } else if state.maxBitrateBps < 3_500_000 {
-                            state.maxBitrateBps = 3_500_000
+                            print("[agent][adapt] viewer=\(viewerId) GOOD → fps \(state.maxFramerate)")
+                        } else if state.maxBitrateBps < maxBitrate {
+                            // ramp up 15% at a time
+                            state.maxBitrateBps = min(maxBitrate, Int(Double(state.maxBitrateBps) * 1.15) + 250_000)
                             self.applyTune(viewerId: viewerId, pc: pc, maxBitrateBps: state.maxBitrateBps, maxFramerate: state.maxFramerate)
-                            print("[agent][adapt] viewer=\(viewerId) GOOD → cap 3.5Mbps")
+                            print(String(format: "[agent][adapt] viewer=%@ GOOD → cap %.2fMbps", viewerId, Double(state.maxBitrateBps)/1_000_000.0))
                         }
                     }
                 }
@@ -538,6 +642,37 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
         t.resume()
         statsTimers[viewerId] = t
         print("[agent][stats] started outbound stats timer viewer=\(viewerId)")
+    }
+
+
+    /// Called whenever the viewer count changes (e.g., a viewer disconnects).
+    /// We retune all remaining senders back toward the single-viewer (Mode A) baseline.
+    private func retuneForViewerCountChange() {
+        let viewerCount = pcs.count
+        let baseBitrate = defaultBaselineMaxBitrateBps()
+        let baseFps = 24
+
+        print("[webrtc] viewerCount changed → \(viewerCount). Retuning remaining senders to baseline \(baseBitrate) @ \(baseFps)fps")
+
+        for (viewerId, pc) in pcs {
+            var state = tuneByViewer[viewerId] ?? VideoTuneState(
+                maxBitrateBps: baseBitrate,
+                maxFramerate: baseFps,
+                baselineMaxBitrateBps: baseBitrate,
+                baselineMaxFramerate: baseFps
+            )
+
+            state.baselineMaxBitrateBps = baseBitrate
+            state.baselineMaxFramerate = baseFps
+            state.maxBitrateBps = baseBitrate
+            state.maxFramerate = baseFps
+            tuneByViewer[viewerId] = state
+
+            applyTune(viewerId: viewerId,
+                      pc: pc,
+                      maxBitrateBps: state.maxBitrateBps,
+                      maxFramerate: state.maxFramerate)
+        }
     }
 
     private func applyTune(viewerId: String, pc: RTCPeerConnection, maxBitrateBps: Int, maxFramerate: Int) {
@@ -622,11 +757,12 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
         }
     }
 
+    
     private func tuneVideoSender(_ sender: RTCRtpSender,
                                  viewerId: String,
                                  maxBitrateBps: Int = 3_500_000,
                                  maxFramerate: Int = 30) {
-        let params = sender.parameters
+        var params = sender.parameters
         guard var enc = params.encodings.first else {
             print("[webrtc] no encodings found")
             return
@@ -637,19 +773,33 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
 
         var newParams = params
         newParams.encodings = [enc]
-        newParams.degradationPreference = NSNumber(value: 2) // maintainResolution (drop FPS before res)
 
+        // Degradation preference:
+        // - During active interaction (scroll/drag), prefer maintaining framerate so motion feels smooth.
+        // - When idle, prefer maintaining resolution so text snaps back to sharp.
+        if interactionActive {
+            newParams.degradationPreference = NSNumber(value: 1) // maintainFramerate
+        } else {
+            newParams.degradationPreference = NSNumber(value: 2) // maintainResolution
+        }
 
         sender.parameters = newParams
 
         if tuneByViewer[viewerId] == nil {
-            tuneByViewer[viewerId] = VideoTuneState(maxBitrateBps: maxBitrateBps, maxFramerate: maxFramerate)
+            tuneByViewer[viewerId] = VideoTuneState(
+                maxBitrateBps: maxBitrateBps,
+                maxFramerate: maxFramerate,
+                baselineMaxBitrateBps: maxBitrateBps,
+                baselineMaxFramerate: maxFramerate
+            )
         } else {
             tuneByViewer[viewerId]?.maxBitrateBps = maxBitrateBps
             tuneByViewer[viewerId]?.maxFramerate = maxFramerate
+            tuneByViewer[viewerId]?.baselineMaxBitrateBps = maxBitrateBps
+            tuneByViewer[viewerId]?.baselineMaxFramerate = maxFramerate
         }
 
-        print("[webrtc] sender tuned viewer=\(viewerId) maxBitrate=\(maxBitrateBps) fps=\(maxFramerate) degradation=maintainResolution")
+        print("[webrtc] sender tuned viewer=\(viewerId) maxBitrate=\(maxBitrateBps) fps=\(maxFramerate) interaction=\(interactionActive ? "on" : "off")")
     }
 
     // MARK: - RTCPeerConnectionDelegate
@@ -713,5 +863,7 @@ func dataChannel(_ dataChannel: RTCDataChannel, didReceiveMessageWith buffer: RT
                         didAdd rtpReceiver: RTCRtpReceiver,
                         streams: [RTCMediaStream]) {}
 }
+
+
 
 

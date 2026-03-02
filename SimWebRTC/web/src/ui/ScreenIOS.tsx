@@ -249,6 +249,21 @@ export default function ScreenIOS() {
         [applyLayout]
     )
 
+    const sendHome = useCallback(() => {
+        if (!device) return
+
+        const ws = wsRef.current
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            console.warn('[control] Home pressed but WebSocket is not open')
+            return
+        }
+
+        ws.send(JSON.stringify({
+            type: 'home',
+            deviceId: device.id,
+        }))
+    }, [device])
+
     //Fires when component mounts - main logic!
     useEffect(() => {
         if (!device) return
@@ -1099,11 +1114,16 @@ export default function ScreenIOS() {
                         View (placeholders)
                     </Typography>
                     <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
-                        <Button size="small" sx={btnSx} disabled>
-                            Fit
+                         {/* Simple Home button to jump to simulator home screen */}
+                         <Button
+                            size="small"
+                            sx={btnSx}
+                            onClick={sendHome}
+                        >
+                            Home
                         </Button>
                         <Button size="small" sx={btnSx} disabled>
-                            Fill
+                            Fit
                         </Button>
                         <Button size="small" sx={btnSx} disabled>
                             1×
