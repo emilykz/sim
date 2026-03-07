@@ -1,0 +1,74 @@
+:root {
+  font-family: "Noto Sans", system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial;
+}
+
+.MuiTypography-root,
+.MuiButton-root,
+.MuiTab-root,
+.MuiMenuItem-root {
+  font-family: inherit !important;
+}
+
+:root[data-theme='dark'] {
+  --bg: #0b0d10;
+  --panel: #0f1217;
+  --border: #1d2430;
+  --text: #e7ecf2;
+  --muted: #9aa8bf;
+  --chip-bg: #151a22;
+  --chip-border: #2a3241;
+
+  --card: #0f1217;
+  --card2: #0c1016;
+
+  --btn: #d1d5db;
+  --btnText: #111827;
+
+  --brandBtn: #2f6fed;
+  --brandBtnHover: #2a63d4;
+  --brandBtnText: #ffffff;
+
+  /* Sidebar tokens */
+  --accent: #68a0ff;
+  --sidebarBg: #0f1217;
+  --sidebarHover: #151a22;
+  --sidebarActive: #151a22;
+
+  --btnDisabledBg: rgba(255, 255, 255, 0.1);
+  --btnDisabledText: rgba(255, 255, 255, 0.7);
+  --btnDisabledBorder: rgba(255, 255, 255, 0.14);
+
+  color-scheme: dark;
+}
+
+:root[data-theme='light'] {
+  --bg: #f6f7fb;
+  --panel: #ffffff;
+  --border: #d7dbe6;
+  --text: #111827;
+  --muted: #55627a;
+  --chip-bg: #f1f3f8;
+  --chip-border: #d7dbe6;
+
+  --card: #ffffff;
+  --card2: #f7f8fc;
+
+  --btn: #111827;
+  --btnText: #ffffff;
+
+  --brandBtn: #0b3a86;
+  --brandBtnHover: #082f6d;
+  --brandBtnText: #ffffff;
+
+  /* Sidebar tokens */
+  --accent: #0b3a86;
+  --sidebarBg: #ffffff;
+  --sidebarHover: #f1f3f8;
+  --sidebarActive: #e9edf3;
+
+  --btnDisabledBg: rgba(17, 24, 39, 0.08);
+  --btnDisabledText: rgba(17, 24, 39, 0.55);
+  --btnDisabledBorder: rgba(17, 24, 39, 0.14);
+
+  color-scheme: light;
+}

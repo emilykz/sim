@@ -2,37 +2,85 @@ import http from "http";
 import { WebSocketServer } from "ws";
 import crypto from "crypto";
 
+//Listening port
 const PORT = 8080;
+
+//Max inboud message payload size 
 const MAX_MSG_BYTES = 256 * 1024;
+
+//Heartbeat sweeper interval timer (30 secs)
 const HEARTBEAT_MS = 30000;
 
-const VIEWER_LIVENESS_TTL_MS = 120000; // 2 minutes // if no heartbeat/traffic within this, treat viewer as gone
+// If a viewer connection has no heartbeats  or traffic for 2 mins, treat as dead and clean up
+const VIEWER_LIVENESS_TTL_MS = 120000; 
+
+//Runs liveness sweep every 5 seconds 
 const VIEWER_SWEEP_MS = 5000;
 
-// deviceId -> agent ws
+// Session inactivity 
+const SESSION_INACTIVITY_MS = 15 * 60 * 1000; // 15 minutes
+const SESSION_SWEEP_MS = 10000; // sweep every  10s
+const RELEASE_CONTROLLER_ONLY = true; // keep watchers; release only controller
+
+// Map of active capture agent WebSockets for each device id 
+// Ex: {"iPhone 16 Pro": <WebSocket#111>} 
 const agents = new Map();
 
-// deviceId -> Map(viewerId -> viewer ws)
+// Maps each device ID to another Map of viewers (viewer id -> viewer WS)
+// Ex: {"iPhone 16 Pro" : { "viewerOne": <WebSocket#111">, "viewerTwo": <WebSocket#222>} }
 const viewersByDevice = new Map();
 
-// viewer ws -> { deviceId, viewerId, lastSeenMs }
+// Stores metadata by the viewer WS ..... { device ID, viewer id, lastSeen<s, lastActivityMs}
+// Ex: { <WebSocket#111> : { deviceId: "IPhone 16  Pro", viewerId: "viewerOne", lastSeenMS...}}
 const viewerMeta = new Map();
 
-// deviceId -> current controller viewerId (or null)
+// A map that tracks which viewerID currently owns control for each device ID 
+// Ex: {"iPhone 16 Pro": "null", "iPhone 16 Pro Max": "viewerOne"} 
 const controllerByDevice = new Map();
 
-// Broadcast a message to all viewers on a device
+// Tracks whether the current controller is warming/ready/error for interaction
+const interactionStateByDevice = new Map();
+
+
+/** 
+ * Broadcast a message to all viewers watching this device
+ * Used for control state updates, stop  stream, agent updates, etc
+*/
 function broadcastToViewers(deviceId, msg) {
-  const m = viewersByDevice.get(deviceId);
-  if (!m) return;
-  for (const vws of m.values()) {
-    send(vws, msg);
+  const viewersForThisDevice = viewersByDevice.get(deviceId);
+  if (!viewersForThisDevice) return;
+  for (const viewer of viewersForThisDevice.values()) {
+    send(viewer, msg);
   }
 }
+
 
 function getController(deviceId) {
   const id = controllerByDevice.get(deviceId);
   return id ?? null;
+}
+
+function getInteractionState(deviceId) {
+  return interactionStateByDevice.get(deviceId) || { state: "idle" };
+}
+
+function setInteractionState(deviceId, state, extra = {}) {
+  if (!deviceId) return;
+
+  const payload = { type: "interaction-state", deviceId, state, ...extra };
+
+  if (state === "idle") {
+    interactionStateByDevice.delete(deviceId);
+  } else {
+    interactionStateByDevice.set(deviceId, { state, ...extra });
+  }
+
+  broadcastToViewers(deviceId, payload);
+
+  const agent = agents.get(deviceId);
+  if (agent) {
+    send(agent, payload);
+  }
 }
 
 function setController(deviceId, viewerIdOrNull) {
@@ -46,17 +94,63 @@ function setController(deviceId, viewerIdOrNull) {
 
   const controllerId = viewerIdOrNull ?? null;
 
+  // Controller ownership changed, so reset readiness until agent says otherwise.
+  if (controllerId) {
+    interactionStateByDevice.set(deviceId, { state: "starting" });
+  } else {
+    interactionStateByDevice.delete(deviceId);
+  }
+
   // Notify all viewers so they can update their "canInteract" UI
   broadcastToViewers(deviceId, { type: "control-state", deviceId, controllerId });
+  broadcastToViewers(deviceId, {
+    type: "interaction-state",
+    deviceId,
+    state: controllerId ? "starting" : "idle"
+  });
 
   // Also notify the agent so it can enforce control server-side if desired
   const agent = agents.get(deviceId);
   if (agent) {
     send(agent, { type: "control-state", deviceId, controllerId });
+    send(agent, {
+      type: "interaction-state",
+      deviceId,
+      state: controllerId ? "starting" : "idle"
+    });
   }
 }
 
-function markAlive(ws) { ws.isAlive = true; }
+function markAlive(ws) { 
+  ws.isAlive = true; 
+}
+
+// ---- Static device catalog (temporary) ----
+const DEVICE_CATALOG = [
+  { id: "sim-ios-16-pro",     name: "iPhone 16 Pro",       platform: "ios",     osVersion: "18.3.1" },
+  { id: "sim-ios-16-pro-max", name: "iPhone 16 Pro Max",   platform: "ios",     osVersion: "18.3.1" },
+  { id: "sim-android-1",      name: "Android Emulator #1", platform: "android", osVersion: "14" },
+  { id: "sim-android-2",      name: "Android Emulator #2", platform: "android", osVersion: "14" },
+];
+
+// status rules (simple)
+function getDeviceStatus(deviceId) {
+  const controllerId = getController(deviceId);
+  if (controllerId) return "in_use";
+  const agentOnline = agents.has(deviceId);
+  if (!agentOnline) return "error";
+  return "available";
+}
+
+function getDeviceCatalogSnapshot() {
+  return DEVICE_CATALOG.map((d) => ({
+    ...d,
+    status: getDeviceStatus(d.id),
+    controllerId: getController(d.id),
+    agentOnline: agents.has(d.id),
+    viewerCount: viewerCount(d.id),
+  }));
+}
 
 function send(ws, obj) {
   if (!ws || ws.readyState !== 1) return;
@@ -90,18 +184,19 @@ function detachViewer(deviceId, viewerId, reason = "") {
   if (vws) {
     // Mark so that if ws "close" fires later we don't double-handle
     vws._viewerDetached = true;
-    viewerMeta.delete(vws);
-    try { vws.terminate(); } catch {}
+    viewerMeta.delete(vws); //delete metadata so no more sweeps and checks 
+    try { vws.terminate(); } catch {} //terminate WS
   }
 
+  //Deletes the viewer from view list 
   if (m) {
-    m.delete(viewerId);
+    m.delete(viewerId); 
     if (m.size === 0) viewersByDevice.delete(deviceId);
   }
 
   // If this viewer was the current controller, clear controller for this device.
   if (getController(deviceId) === viewerId) {
-    setController(deviceId, null);   // ✅ your “controller = null on disconnect” requirement
+    setController(deviceId, null);   
   }
 
   const agent = agents.get(deviceId);
@@ -109,11 +204,24 @@ function detachViewer(deviceId, viewerId, reason = "") {
     console.log("[route] viewer-left -> agent", { deviceId, viewerId, reason });
     send(agent, { type: "viewer-left", deviceId, viewerId, reason });
     notifyViewerCount(deviceId);
+    if (viewerCount(deviceId) === 0) {
+      send(agent, { type: "stop-stream", deviceId, reason: reason || "no-viewers" });
+    }
   }
 }
 
 
 const httpServer = http.createServer((req, res) => {
+  if (req.url === "/api/devices") {
+    const body = JSON.stringify({ devices: getDeviceCatalogSnapshot() });
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+    });
+    res.end(body);
+    return;
+  }
+
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("ok");
 });
@@ -151,14 +259,31 @@ wssViewers.on("connection", (ws, req) => {
   let deviceId = null;
   let viewerId = null;
 
-  const touch = () => {
+  //Hanlder for updating seen field 
+  const touchSeen = () => {
     if (deviceId && viewerId) {
-      viewerMeta.set(ws, { deviceId, viewerId, lastSeenMs: Date.now() });
+      const prev = viewerMeta.get(ws) || { deviceId, viewerId };
+      viewerMeta.set(ws, { ...prev, deviceId, viewerId, lastSeenMs: Date.now() });
+    }
+  };
+
+  //Handler for updating viewer user activity 
+  const touchActivity = () => {
+    if (deviceId && viewerId) {
+      const prev = viewerMeta.get(ws) || { deviceId, viewerId };
+      viewerMeta.set(ws, { ...prev, deviceId, viewerId, lastSeenMs: Date.now(), lastActivityMs: Date.now() });
     }
   };
 
   ws.on("message", (buf) => {
-    if (buf.length > MAX_MSG_BYTES) { try { ws.close(1009, "message too big"); } catch {} return; }
+
+    if (buf.length > MAX_MSG_BYTES) { 
+      try { 
+        ws.close(1009, "message too big");
+       } catch {} 
+       return; 
+    }
+    
     let msg;
     try { msg = JSON.parse(buf.toString()); } catch { return; }
 
@@ -168,11 +293,12 @@ wssViewers.on("connection", (ws, req) => {
     if (msg.type === "heartbeat") {
       if (!deviceId) deviceId = msg.deviceId;
       if (!viewerId) viewerId = msg.viewerId;
-      touch();
+      touchSeen();
       return;
     }
 
     if (msg.type === "obs" || msg.type === "obs-ttff") {
+      touchSeen();
       console.log("[obs]", { deviceId: msg.deviceId, viewerId: msg.viewerId, type: msg.type, ttffMs: msg.ttffMs, qos: msg.qos, ice: msg.ice });
       return;
     }
@@ -185,7 +311,7 @@ wssViewers.on("connection", (ws, req) => {
       m.set(viewerId, ws);
     
       ws._viewerDetached = false;
-      viewerMeta.set(ws, { deviceId, viewerId, lastSeenMs: Date.now() });
+      viewerMeta.set(ws, { deviceId, viewerId, lastSeenMs: Date.now(), lastActivityMs: Date.now() });
     
       send(ws, { type: "viewer-id", deviceId, viewerId });
       send(ws, { type: "agent-state", deviceId, online: agents.has(deviceId) });
@@ -199,8 +325,12 @@ wssViewers.on("connection", (ws, req) => {
       const current = getController(deviceId);
       if (!current) {
         setController(deviceId, viewerId);
+        const interaction = getInteractionState(deviceId);
+        send(ws, { type: "interaction-state", deviceId, ...interaction });
       } else {
         send(ws, { type: "control-state", deviceId, controllerId: current });
+        const interaction = getInteractionState(deviceId);
+        send(ws, { type: "interaction-state", deviceId, ...interaction });
       }
     
       console.log("[viewer] registered", { deviceId, viewerId });
@@ -210,8 +340,15 @@ wssViewers.on("connection", (ws, req) => {
 
     if (!deviceId) deviceId = msg.deviceId;
 
-    // Any message from a registered viewer counts as liveness.
-    touch();
+    // Distinguish liveness vs user activity (so stats/heartbeats don't keep sessions alive forever)
+    const isUserActivity =
+      msg.type === "pointer" ||
+      msg.type === "key" ||
+      msg.type === "text" ||
+      msg.type === "home";
+
+    if (isUserActivity) touchActivity();
+    else touchSeen();
 
     const agent = agents.get(deviceId);
     if (!agent) {
@@ -264,6 +401,13 @@ wssAgents.on("connection", (ws, req) => {
 
       // Server-owned viewer-count snapshot (useful if viewers were already connected)
       notifyViewerCount(deviceId);
+      return;
+    }
+
+    if (msg.type === "interaction-state") {
+      const d = msg.deviceId ?? deviceId;
+      if (!d) return;
+      setInteractionState(d, msg.state || "idle", msg.reason ? { reason: msg.reason } : {});
       return;
     }
 
@@ -329,3 +473,36 @@ setInterval(() => {
     try { ws.terminate(); } catch {}
   }
 }, VIEWER_SWEEP_MS);
+
+
+// Session inactivity sweep: release idle controller after 15 minutes (watchers remain)
+setInterval(() => {
+  const now = Date.now();
+
+  for (const [ws, meta] of viewerMeta.entries()) {
+    if (!meta?.deviceId || !meta?.viewerId) continue;
+
+    const { deviceId, viewerId } = meta;
+    const lastAct = meta.lastActivityMs ?? meta.lastSeenMs ?? 0;
+    if (!lastAct) continue;
+
+    if (RELEASE_CONTROLLER_ONLY) {
+      const controllerId = getController(deviceId);
+      if (!controllerId || controllerId !== viewerId) continue;
+    }
+
+    if (now - lastAct <= SESSION_INACTIVITY_MS) continue;
+
+    console.log("[session] releasing due to inactivity", { deviceId, viewerId, idleMs: now - lastAct });
+
+    // Notify the viewer UI before we terminate
+    try {
+      send(ws, { type: "session-released", deviceId, viewerId, reason: "inactivity" });
+    } catch {}
+
+    // Detach will clear controller and notify agent
+    detachViewer(deviceId, viewerId, "inactivity");
+
+    try { ws.terminate(); } catch {}
+  }
+}, SESSION_SWEEP_MS);

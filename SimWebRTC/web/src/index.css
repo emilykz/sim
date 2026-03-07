@@ -1,0 +1,16 @@
+
+/* Height chain: cover common mount ids just in case */
+html, body, #root, #app, #__next {
+    height: 100%;
+    margin: 0;
+  }
+  
+  /* Force background everywhere so no “band” can show through */
+  html, body, #root, #app, #__next {
+    background: var(--bg);
+  }
+  
+  /* Optional: remove default body padding/scroll quirks */
+  body {
+    overflow: hidden;
+  }

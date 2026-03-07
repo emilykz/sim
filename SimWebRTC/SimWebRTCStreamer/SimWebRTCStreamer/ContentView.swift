@@ -2,6 +2,12 @@ import SwiftUI
 import Foundation
 import QuartzCore
 
+private enum CaptureDefaults {
+    // Middle ground: slightly higher source detail without the startup penalty of 1600+/30fps.
+    static let fps: Int = 24
+    static let maxLongEdgePx: Int = 1440
+}
+
 final class AgentApp: ObservableObject {
     @Published var status: String = "idle"
     @Published var frameWidth: Int = 0
@@ -26,6 +32,19 @@ final class AgentApp: ObservableObject {
     private var appiumKeepAliveTimer: Timer? = nil
     private var appiumUdid: String? = nil
     private var lastPlatformStr: String = "ios"
+
+    private enum AppiumLeaseState: Equatable {
+        case idle
+        case starting
+        case ready
+        case stopping
+        case error(String)
+    }
+
+    private var appiumState: AppiumLeaseState = .idle
+    private var appiumStartTask: Task<String?, Never>? = nil
+    private var appiumConsecutiveFailures: Int = 0
+    private let maxTransientAppiumFailures: Int = 3
 
     // Pointer aggregation (down/move/up -> tap/swipe)
     private var pointerDown: (x: Double, y: Double, t: CFTimeInterval)? = nil
@@ -184,19 +203,22 @@ final class AgentApp: ObservableObject {
             currentControllerId = controllerId
             print("[agent] control-state deviceId=\(deviceId) controllerId=\(controllerId ?? "nil")")
 
+            let gainedControl = controllerId != nil && prev != controllerId
+            let lostOrTransferredControl = controllerId == nil || (prev != nil && prev != controllerId)
+
             // If control was released or transferred, end the current Appium session.
-            if controllerId == nil || (prev != nil && prev != controllerId) {
+            if lostOrTransferredControl {
                 pointerDown = nil
                 pointerLast = nil
+                notifyInteractionState("idle")
                 Task { [weak self] in
                     await self?.stopAppiumSession(reason: "control-state-changed")
                 }
             }
 
-
-
-            // Pre-warm Appium session when someone takes control (so first tap is instant)
-            if controllerId != nil {
+            // Pre-warm Appium session only when control is newly acquired by someone.
+            if gainedControl {
+                notifyInteractionState("starting")
                 Task { [weak self] in
                     _ = await self?.ensureAppiumSession()
                 }
@@ -295,7 +317,31 @@ final class AgentApp: ObservableObject {
             break
         }
     }
+    
+    private func notifyInteractionState(_ state: String, reason: String? = nil) {
+        var msg: [String: Any] = [
+            "type": "interaction-state",
+            "deviceId": deviceId,
+            "state": state
+        ]
+        if let reason = reason, !reason.isEmpty {
+            msg["reason"] = reason
+        }
+        signaling?.send(msg)
+    }
 
+    private func recordAppiumSuccess() {
+        appiumConsecutiveFailures = 0
+    }
+
+    private func recordAppiumFailure(_ reason: String) async {
+        appiumConsecutiveFailures += 1
+        print("[appium] failure count=\(appiumConsecutiveFailures) reason=\(reason)")
+        if appiumConsecutiveFailures >= maxTransientAppiumFailures {
+            await stopAppiumSession(reason: "too-many-failures-\(reason)")
+        }
+    }
+    
     // MARK: - Appium control (iOS simulator)
 
     private func ensureAppiumSession() async -> String? {
@@ -305,11 +351,13 @@ final class AgentApp: ObservableObject {
         }
         guard let udid = appiumUdid, !udid.contains("<PUT_UDID_HERE>") else {
             print("[appium] ❌ missing UDID for deviceId=\(deviceId) (set DeviceConfig.udid)")
+            appiumState = .error("missing-udid")
+            notifyInteractionState("error", reason: "missing-udid")
             return nil
         }
 
-        // If we already have a session, reuse it.
-        if let sid = appiumSessionId {
+        // If we already have a ready session, reuse it.
+        if let sid = appiumSessionId, appiumState == .ready {
             if appiumWindowRect == nil {
                 do {
                     let rect = try await appium.getWindowRect(sessionId: sid)
@@ -322,25 +370,60 @@ final class AgentApp: ObservableObject {
             return sid
         }
 
-        do {
-            let sid = try await appium.createIOSSession(udid: udid, deviceName: deviceId)
-            appiumSessionId = sid
-            print("[appium] ✅ session created sessionId=\(sid) udid=\(udid)")
-
-            let rect = try await appium.getWindowRect(sessionId: sid)
-            appiumWindowRect = (rect.width, rect.height)
-            print("[appium] ✅ windowRect w=\(rect.width) h=\(rect.height)")
-            return sid
-        } catch {
-            print("[appium] ❌ create session failed:", error.localizedDescription)
-            appiumSessionId = nil
-            appiumWindowRect = nil
-            return nil
+        // Singleflight: if a start is already in progress, await it.
+        if appiumState == .starting, let task = appiumStartTask {
+            return await task.value
         }
+
+        appiumState = .starting
+        notifyInteractionState("starting")
+
+        let task = Task<String?, Never> { [weak self] in
+            guard let self else { return nil }
+
+            do {
+                let sid = try await self.appium.createIOSSession(udid: udid, deviceName: self.deviceId)
+                self.appiumSessionId = sid
+                print("[appium] ✅ session created sessionId=\(sid) udid=\(udid)")
+
+                let rect = try await self.appium.getWindowRect(sessionId: sid)
+                self.appiumWindowRect = (rect.width, rect.height)
+                print("[appium] ✅ windowRect w=\(rect.width) h=\(rect.height)")
+
+                self.appiumState = .ready
+                self.recordAppiumSuccess()
+                self.startAppiumKeepAlive()
+                self.notifyInteractionState("ready")
+                return sid
+            } catch {
+                print("[appium] ❌ create session failed:", error.localizedDescription)
+                self.appiumSessionId = nil
+                self.appiumWindowRect = nil
+                self.stopAppiumKeepAlive()
+                self.appiumState = .error(error.localizedDescription)
+                self.notifyInteractionState("error", reason: error.localizedDescription)
+                return nil
+            }
+        }
+
+        appiumStartTask = task
+        let sid = await task.value
+        appiumStartTask = nil
+        return sid
     }
 
     private func stopAppiumSession(reason: String) async {
-        guard let sid = appiumSessionId else { return }
+        stopAppiumKeepAlive()
+        appiumStartTask = nil
+        appiumState = .stopping
+
+        guard let sid = appiumSessionId else {
+            appiumWindowRect = nil
+            appiumState = .idle
+            notifyInteractionState("idle", reason: reason)
+            return
+        }
+
         appiumSessionId = nil
         appiumWindowRect = nil
 
@@ -350,6 +433,9 @@ final class AgentApp: ObservableObject {
         } catch {
             print("[appium] ⚠️ delete session failed sessionId=\(sid) reason=\(reason) err=\(error.localizedDescription)")
         }
+
+        appiumState = .idle
+        notifyInteractionState("idle", reason: reason)
     }
 
     private func startAppiumKeepAlive() {
@@ -364,7 +450,13 @@ final class AgentApp: ObservableObject {
                 guard let self else { return }
                 // Force a cheap command so Appium doesn't time out
                 if let sid = self.appiumSessionId {
-                    _ = try? await self.appium.getWindowRect(sessionId: sid)
+                    do {
+                        _ = try await self.appium.getWindowRect(sessionId: sid)
+                        self.recordAppiumSuccess()
+                    } catch {
+                        print("[appium] keepalive failed:", error.localizedDescription)
+                        await self.recordAppiumFailure("keepalive")
+                    }
                 }
             }
         }
@@ -378,8 +470,26 @@ final class AgentApp: ObservableObject {
 
     private func toDeviceXY(xNorm: Double, yNorm: Double) -> (x: Int, y: Int)? {
         guard let rect = appiumWindowRect else { return nil }
-        let x = Int(max(0, min(1, xNorm)) * rect.width)
-        let y = Int(max(0, min(1, yNorm)) * rect.height)
+        guard rect.width.isFinite, rect.height.isFinite,
+              rect.width > 0, rect.height > 0,
+              rect.width <= Double(Int.max), rect.height <= Double(Int.max) else {
+            print("[appium] invalid window rect w=\(rect.width) h=\(rect.height); dropping pointer")
+            return nil
+        }
+
+        let safeXNorm = xNorm.isFinite ? max(0, min(1, xNorm)) : 0
+        let safeYNorm = yNorm.isFinite ? max(0, min(1, yNorm)) : 0
+
+        let xDouble = safeXNorm * rect.width
+        let yDouble = safeYNorm * rect.height
+        guard xDouble.isFinite, yDouble.isFinite,
+              xDouble <= Double(Int.max), yDouble <= Double(Int.max) else {
+            print("[appium] invalid pointer conversion x=\(xDouble) y=\(yDouble); dropping pointer")
+            return nil
+        }
+
+        let x = Int(xDouble)
+        let y = Int(yDouble)
         return (x, y)
     }
 
@@ -419,10 +529,11 @@ final class AgentApp: ObservableObject {
                       let sid = appiumSessionId else { return }
                 do {
                     try await appium.tap(sessionId: sid, x: xy.x, y: xy.y)
+                    recordAppiumSuccess()
                     print("[appium] tap x=\(xy.x) y=\(xy.y)")
                 } catch {
                     print("[appium] ❌ tap failed:", error.localizedDescription)
-                    await stopAppiumSession(reason: "tap-failed")
+                    await recordAppiumFailure("tap")
                 }
             } else {
                 guard let startXY = toDeviceXY(xNorm: down.x, yNorm: down.y),
@@ -434,10 +545,11 @@ final class AgentApp: ObservableObject {
 
                 do {
                     try await appium.swipe(sessionId: sid, x1: startXY.x, y1: startXY.y, x2: endXY.x, y2: endXY.y, durationMs: ms)
+                    recordAppiumSuccess()
                     print("[appium] swipe (\(startXY.x),\(startXY.y)) -> (\(endXY.x),\(endXY.y)) ms=\(ms)")
                 } catch {
                     print("[appium] ❌ swipe failed:", error.localizedDescription)
-                    await stopAppiumSession(reason: "swipe-failed")
+                    await recordAppiumFailure("swipe")
                 }
             }
 
@@ -453,10 +565,11 @@ final class AgentApp: ObservableObject {
         guard let sid = await ensureAppiumSession() else { return }
         do {
             try await appium.sendKeys(sessionId: sid, text: text)
+            recordAppiumSuccess()
             print("[appium] keys textLen=\(text.count)")
         } catch {
             print("[appium] ❌ sendKeys failed:", error.localizedDescription)
-            await stopAppiumSession(reason: "keys-failed")
+            await recordAppiumFailure("keys")
         }
     }
 
@@ -480,10 +593,11 @@ final class AgentApp: ObservableObject {
         let v = AppiumDriver.specialKeyValue(code: code, key: key) ?? key
         do {
             try await appium.sendKeyValue(sessionId: sid, value: v)
+            recordAppiumSuccess()
             print("[appium] key code=\(code) key=\(key)")
         } catch {
             print("[appium] ❌ key failed:", error.localizedDescription)
-            await stopAppiumSession(reason: "key-failed")
+            await recordAppiumFailure("key")
         }
     }
     
@@ -493,12 +607,14 @@ final class AgentApp: ObservableObject {
         guard let sid = await ensureAppiumSession() else { return }
         do {
             try await appium.pressHome(sessionId: sid)
+            recordAppiumSuccess()
             print("[appium] home pressed")
         } catch {
             print("[appium] ❌ home failed:", error.localizedDescription)
-            await stopAppiumSession(reason: "home-failed")
+            await recordAppiumFailure("home")
         }
     }
+    
 
     private func restartCapture(platformStr: String, windowMatch: String?) {
         // Cancel any pending stop timer
@@ -524,8 +640,8 @@ final class AgentApp: ObservableObject {
                 try await self.capture.startCapture(
                     platform: platform,
                     windowMatch: windowMatch,
-                    fps: 24,
-                    maxLongEdgePixels: 1280
+                    fps: CaptureDefaults.fps,
+                    maxLongEdgePixels: CaptureDefaults.maxLongEdgePx
                 )
                 print("[agent] capture started platform=\(platformStr) windowMatch=\(windowMatch ?? "nil")")
             } catch {
@@ -609,10 +725,12 @@ final class AppiumDriver {
         let json = try await requestJSON(method: "GET", url: url, body: nil)
 
         if let v = json["value"] as? [String: Any],
-           let x = v["x"] as? Double,
-           let y = v["y"] as? Double,
-           let w = v["width"] as? Double,
-           let h = v["height"] as? Double {
+           let x = parseDouble(v["x"]),
+           let y = parseDouble(v["y"]),
+           let w = parseDouble(v["width"]),
+           let h = parseDouble(v["height"]),
+           x.isFinite, y.isFinite, w.isFinite, h.isFinite,
+           w > 0, h > 0, w <= 100_000, h <= 100_000 {
             return WindowRect(x: x, y: y, width: w, height: h)
         }
 
@@ -752,6 +870,21 @@ final class AppiumDriver {
         if data.isEmpty { return [:] }
         let any = try JSONSerialization.jsonObject(with: data, options: [])
         return any as? [String: Any] ?? [:]
+    }
+
+    private func parseDouble(_ value: Any?) -> Double? {
+        switch value {
+        case let number as NSNumber:
+            return number.doubleValue
+        case let double as Double:
+            return double
+        case let int as Int:
+            return Double(int)
+        case let string as String:
+            return Double(string)
+        default:
+            return nil
+        }
     }
 }
 

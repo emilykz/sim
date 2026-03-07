@@ -9,6 +9,8 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
 
     // MARK: - Version banner (so you can confirm you’re running the right binary)
     private let buildTag = "WEBRTC_MANAGER_WAN_UI_v1"
+    private let enableRuntimeStats = false
+    private let enableVerboseSetupLogs = false
 
     // MARK: - Public callbacks (wired by ContentView)
     var onLocalIce: ((_ viewerId: String, _ candidate: RTCIceCandidate) -> Void)?
@@ -143,6 +145,8 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
     /// Called by your ScreenCapture pipeline.
     func pushFrame(_ frame: RTCVideoFrame) {
         pushedFrames += 1
+        lastFrameWidth = Int(frame.width)
+        lastFrameHeight = Int(frame.height)
 
         if !didLogFirstPush {
             didLogFirstPush = true
@@ -164,13 +168,15 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
 
             self.interactionActive = true
 
-            // Re-apply current tuning so degradationPreference switches to maintainFramerate.
+            // During active touch input, trade a bit of sharpness for smoother motion.
             for (viewerId, pc) in self.pcs {
                 if let state = self.tuneByViewer[viewerId] {
+                    let boostedBitrate = max(state.maxBitrateBps, Int(Double(state.baselineMaxBitrateBps) * 1.25))
+                    let boostedFramerate = max(state.maxFramerate, 30)
                     self.applyTune(viewerId: viewerId,
                                    pc: pc,
-                                   maxBitrateBps: state.maxBitrateBps,
-                                   maxFramerate: state.maxFramerate)
+                                   maxBitrateBps: boostedBitrate,
+                                   maxFramerate: boostedFramerate)
                 }
             }
 
@@ -222,19 +228,17 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
         if lastTuneKey == key { return }
         lastTuneKey = key
 
-        // Global-friendly bitrate ladder (still sharp, but won’t explode on WAN)
-        // 720p: 2.5–3.5 Mbps
-        // 1080p: 4.0–5.5 Mbps (only if you actually capture that high)
+        // Bias startup toward crisp text without increasing capture resolution.
+        // Screen content benefits more from bitrate than from pushing much larger initial frames.
         let targetBitrate: Int
         if longEdge <= 1280 {
-            targetBitrate = 3_500_000
+            targetBitrate = 6_000_000
         } else if longEdge <= 1920 {
-            targetBitrate = 5_500_000
+            targetBitrate = 8_500_000
         } else {
-            // Tall iPhone sims (e.g., 1300x2796) need more headroom to stay sharp during fast scroll.
             targetBitrate = 12_000_000
         }
-        let targetFps = 30
+        let targetFps = 24
 
         for (viewerId, pc) in pcs {
             for sender in pc.senders where sender.track?.kind == "video" {
@@ -258,8 +262,10 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
         viewerIdByPC[ObjectIdentifier(pc)] = viewerId
 
         print("✅ [agent] created PC for viewerId=\(viewerId)")
-        print("[agent][stats] starting outbound stats viewer=\(viewerId)")
-        startOutboundStats(viewerId: viewerId, pc: pc)
+        if enableRuntimeStats {
+            print("[agent][stats] starting outbound stats viewer=\(viewerId)")
+            startOutboundStats(viewerId: viewerId, pc: pc)
+        }
 
         // IMPORTANT:
         // Do NOT addTrack/addTransceiver here (before setRemoteDescription).
@@ -295,8 +301,9 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
         
         let pc = ensurePC(for: viewerId)
 
-        // Useful: log what the viewer actually offered.
-        dumpVideoSection(from: sdp, header: "OFFER")
+        if enableVerboseSetupLogs {
+            dumpVideoSection(from: sdp, header: "OFFER")
+        }
 
         let offer = RTCSessionDescription(type: .offer, sdp: sdp)
         pc.setRemoteDescription(offer) { [weak self] err in
@@ -346,8 +353,10 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
                     }
 
                     print("[agent] sending answer viewerId=\(viewerId) sdpLen=\(finalAnswer.sdp.count)")
-                    dumpVideoSection(from: finalAnswer.sdp, header: "ANSWER")
-                    logTransceivers(pc)
+                    if self.enableVerboseSetupLogs {
+                        dumpVideoSection(from: finalAnswer.sdp, header: "ANSWER")
+                        logTransceivers(pc)
+                    }
 
                     // Flush queued ICE
                     if let queued = self.pendingCandidates.removeValue(forKey: viewerId) {
@@ -774,10 +783,9 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
         var newParams = params
         newParams.encodings = [enc]
 
-        // Degradation preference:
-        // - During active interaction (scroll/drag), prefer maintaining framerate so motion feels smooth.
-        // - When idle, prefer maintaining resolution so text snaps back to sharp.
-        if interactionActive {
+        // At the current 24fps profile, preserving resolution produces a better result than
+        // dropping detail for framerate during interaction.
+        if interactionActive && maxFramerate >= 28 {
             newParams.degradationPreference = NSNumber(value: 1) // maintainFramerate
         } else {
             newParams.degradationPreference = NSNumber(value: 2) // maintainResolution
@@ -863,7 +871,3 @@ func dataChannel(_ dataChannel: RTCDataChannel, didReceiveMessageWith buffer: RT
                         didAdd rtpReceiver: RTCRtpReceiver,
                         streams: [RTCMediaStream]) {}
 }
-
-
-
-
