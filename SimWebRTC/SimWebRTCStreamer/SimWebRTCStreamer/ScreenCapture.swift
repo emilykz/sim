@@ -167,10 +167,20 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate {
 
         let full = window.frame // points
 
-        // Your crops (points)
-        let cropTopWanted: CGFloat = cropTopPoints
-        let cropLRWanted: CGFloat = 0  // ✅ trim rounded-corner black pixels (was 0)
-        let cropBottomWanted: CGFloat = 10
+        // Simulators need the existing top trim; emulators should keep the full status bar/header.
+        let cropTopWanted: CGFloat
+        let cropLRWanted: CGFloat
+        let cropBottomWanted: CGFloat
+        switch platform {
+        case .simulator:
+            cropTopWanted = cropTopPoints
+            cropLRWanted = 0
+            cropBottomWanted = 10
+        case .emulator:
+            cropTopWanted = 0
+            cropLRWanted = 0
+            cropBottomWanted = 0
+        }
 
         // Clamp crops so we never go to/under 0 size
         let cropTop = min(max(0, cropTopWanted), full.height - 2)
@@ -334,6 +344,4 @@ final class ScreenCaptureSource: NSObject, SCStreamOutput, SCStreamDelegate {
         repeatTimer = nil
     }
 }
-
-
 

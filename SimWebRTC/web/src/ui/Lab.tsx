@@ -10,6 +10,7 @@ type Session = {
   deviceId: string
   name: string
   platform: 'ios' | 'android'
+  viewOnly?: boolean
   openedAt: number
   lastActivityAt: number
   pendingReleaseReason?: string | null
@@ -44,6 +45,7 @@ export default function Lab() {
       return Array.isArray(parsed)
         ? parsed.map((s: any) => ({
             ...s,
+            viewOnly: !!s?.viewOnly,
             pendingReleaseReason: s?.pendingReleaseReason ?? null,
           }))
         : []
@@ -101,7 +103,7 @@ export default function Lab() {
   /**
    * Handler when user clicks opens/launches a device
    */
-  const openDevice = useCallback((deviceId: string) => {
+  const openDevice = useCallback((deviceId: string, viewOnly = false) => {
 
     //Finds the device that matches the specified device id 
     const foundDevice = devices.find(device => device.id === deviceId)
@@ -118,7 +120,9 @@ export default function Lab() {
       //If a session already exists, refresh lastActivityAt timestamp to now and clear any pending release reason & return
       if (exists) {
         return prev.map(session =>
-          session.deviceId === deviceId ? { ...session, lastActivityAt: Date.now(), pendingReleaseReason: null } : session
+          session.deviceId === deviceId
+            ? { ...session, viewOnly: !!session.viewOnly || viewOnly, lastActivityAt: Date.now(), pendingReleaseReason: null }
+            : session
         )
       }
       //No session exists for this device ID -> create a new Session
@@ -126,6 +130,7 @@ export default function Lab() {
         deviceId,
         name: foundDevice.name,
         platform: foundDevice.platform,
+        viewOnly,
         openedAt: Date.now(),
         lastActivityAt: Date.now(),
         pendingReleaseReason: null,
@@ -364,6 +369,7 @@ export default function Lab() {
                   <ScreenIOS
                     deviceId={s.deviceId}
                     isActive={active}
+                    viewOnly={!!s.viewOnly}
                     pendingReleaseReason={s.pendingReleaseReason}
                     onActivity={() => markActivity(s.deviceId)}
                     onReleased={(info) => {

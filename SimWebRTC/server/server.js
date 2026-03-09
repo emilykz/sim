@@ -306,6 +306,7 @@ wssViewers.on("connection", (ws, req) => {
     if (msg.type === "iam-viewer") {
       deviceId = msg.deviceId;
       viewerId = msg.viewerId ?? crypto.randomUUID();
+      const requestedViewOnly = !!msg.viewOnly;
     
       const m = getViewersMap(deviceId);
       m.set(viewerId, ws);
@@ -323,17 +324,17 @@ wssViewers.on("connection", (ws, req) => {
       // - If no controller yet, first viewer becomes controller.
       // - Otherwise, just send the current controller snapshot to this viewer.
       const current = getController(deviceId);
-      if (!current) {
+      if (!current && !requestedViewOnly) {
         setController(deviceId, viewerId);
         const interaction = getInteractionState(deviceId);
         send(ws, { type: "interaction-state", deviceId, ...interaction });
       } else {
-        send(ws, { type: "control-state", deviceId, controllerId: current });
+        send(ws, { type: "control-state", deviceId, controllerId: current ?? null });
         const interaction = getInteractionState(deviceId);
         send(ws, { type: "interaction-state", deviceId, ...interaction });
       }
     
-      console.log("[viewer] registered", { deviceId, viewerId });
+      console.log("[viewer] registered", { deviceId, viewerId, viewOnly: requestedViewOnly });
       return;
     }
       

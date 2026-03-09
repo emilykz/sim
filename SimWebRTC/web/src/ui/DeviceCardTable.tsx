@@ -10,7 +10,7 @@ export default function DeviceCardTable({
 }: {
   title: string
   devices: CatalogDevice[]
-  onOpen: (deviceId: string) => void
+  onOpen: (deviceId: string, viewOnly?: boolean) => void
 }) {
 
 

@@ -14,8 +14,15 @@ export const devices = [
     bezelKind: 'proMax',
   },
   {
-    id: 'sim-android-36',
+    id: 'sim-android-1',
     name: 'Android Emulator #1',
+    platform: 'android',
+    windowMatch: 'Android Emulator',
+    bezelKind: 'android',
+  },
+  {
+    id: 'sim-android-2',
+    name: 'Android Emulator #2',
     platform: 'android',
     windowMatch: 'Android Emulator',
     bezelKind: 'android',

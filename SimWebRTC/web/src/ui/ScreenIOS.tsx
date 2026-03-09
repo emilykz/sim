@@ -83,6 +83,7 @@ function pickBezelKind(deviceName: string): keyof typeof BEZELS {
 type ScreenIOSProps = {
   deviceId?: string
   isActive?: boolean
+  viewOnly?: boolean
   onActivity?: () => void
   onReleased?: (info: { reason: string; silent?: boolean }) => void
   pendingReleaseReason?: string | null
@@ -169,23 +170,19 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
     }
     const sock = wsRef.current
     if (sock) {
-      try {
+     
         sock.onopen = null
         sock.onmessage = null
         sock.onclose = null
         sock.onerror = null
-      } catch {}
-      try {
         sock.close()
-      } catch {}
+      
       wsRef.current = null
     }
     const pc = pcRef.current
     if (pc) {
-      try {
         pc.close()
-      } catch {}
-    }
+      }
   }, [])
   const startedRef = useRef(false)
 
@@ -196,6 +193,7 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
   const canControl = !!viewerId && !!controllerId && viewerId === controllerId
   const canInteract = canControl && interactionState === 'ready'
   const isWarmingControl = canControl && interactionState === 'starting'
+  const hasControllerError = canControl && interactionState === 'error'
   const canInteractRef = useRef(false)
   useEffect(() => {
     canInteractRef.current = !!canInteract
@@ -272,6 +270,7 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
 
   // Bezel PNG natural size
   const [bezelNatural, setBezelNatural] = useState<{ w: number; h: number } | null>(null)
+  const hasBezel = device?.platform === 'ios'
 
   const bezelKind = pickBezelKind(device?.name || '')
   const bezelSrc = BEZELS[bezelKind]
@@ -279,6 +278,10 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
 
   // Load bezel image once to get naturalWidth/Height
   useEffect(() => {
+    if (!hasBezel) {
+      setBezelNatural(null)
+      return
+    }
     let cancelled = false
     const img = new Image()
     img.onload = () => {
@@ -294,11 +297,12 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
     return () => {
       cancelled = true
     }
-  }, [bezelSrc])
+  }, [bezelSrc, hasBezel])
 
   const computeFrame = useCallback(() => {
     const base = baseSizeRef.current
     if (!base) return null
+    if (!hasBezel) return null
     if (!bezelNatural) return null
 
     const fracW = 1 - insetsFrac.left - insetsFrac.right
@@ -324,7 +328,7 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
       bezelNatural,
       insetsFrac,
     }
-  }, [bezelNatural, insetsFrac, bezelSrc])
+  }, [bezelNatural, insetsFrac, bezelSrc, hasBezel])
 
   const applyLayout = useCallback(
     (newZoom: number) => {
@@ -346,7 +350,7 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
         screenClip.style.width = Math.round(base.w * newZoom) + 'px'
         screenClip.style.height = Math.round(base.h * newZoom) + 'px'
 
-        const rFrac = 0.035
+        const rFrac = device?.platform === 'android' ? 0.05 : 0.035
         const r = Math.round(Math.min(base.w, base.h) * rFrac * newZoom)
         screenClip.style.borderRadius = r + 'px'
 
@@ -370,7 +374,7 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
       video.style.width = '100%'
       video.style.height = '100%'
     },
-    [computeFrame, bezelKind]
+    [computeFrame, bezelKind, device?.platform]
   )
 
   const MIN_RELATIVE_ZOOM = 0.4
@@ -505,7 +509,7 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
       //When the socket opens, we send a message to server for viewing! 
       sock.onopen = async () => {
         wsAttempt = 0
-        sock.send(JSON.stringify({ type: 'iam-viewer', deviceId: device.id }))
+        sock.send(JSON.stringify({ type: 'iam-viewer', deviceId: device.id, viewOnly: !!props.viewOnly }))
 
         //Adds a video transciever for our PC to recieve video only 
         const tx = pc.addTransceiver('video', { direction: 'recvonly' })
@@ -869,14 +873,14 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
 
       setBaseSizeOnce(w, h)
 
+      applyLayoutRef.current(scaleRef.current)
+      setLayoutReady(true)
+
       const geom = computeFrameRef.current()
-      if (geom) {
-        applyLayoutRef.current(scaleRef.current)
-        setLayoutReady(true)
-      }
-      if (!didAutoFit && !userZoomedRef.current && geom) {
+      if (!didAutoFit && !userZoomedRef.current) {
         didAutoFit = true
-        doAutoFit(geom.frameW, geom.frameH)
+        if (geom) doAutoFit(geom.frameW, geom.frameH)
+        else doAutoFit(w, h)
       }
       return true
     }
@@ -1175,6 +1179,8 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
                   overflow: 'hidden',
                   background: '#000',
                   zIndex: 1,
+                  border: hasBezel ? 'none' : '1px solid var(--border)',
+                  boxShadow: hasBezel ? 'none' : '0 10px 30px rgba(0,0,0,0.22)',
                 }}
               >
                 <video
@@ -1193,20 +1199,22 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
                 />
               </Box>
 
-              <img
-                src={bezelSrc}
-                alt="device frame"
-                style={{
-                  position: 'absolute',
-                  inset: 0,
-                  width: '100%',
-                  height: '100%',
-                  objectFit: 'contain',
-                  pointerEvents: 'none',
-                  userSelect: 'none',
-                  zIndex: 3,
-                }}
-              />
+              {hasBezel && (
+                <img
+                  src={bezelSrc}
+                  alt="device frame"
+                  style={{
+                    position: 'absolute',
+                    inset: 0,
+                    width: '100%',
+                    height: '100%',
+                    objectFit: 'contain',
+                    pointerEvents: 'none',
+                    userSelect: 'none',
+                    zIndex: 3,
+                  }}
+                />
+              )}
 
               <Box
                 ref={plusRef}
@@ -1368,19 +1376,29 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
             }}
           >
             {/* Interaction status */}
-            <Box className={`modeCard ${canInteract ? 'interact' : isWarmingControl ? 'interact' : 'viewonly'}`}>
-              <span className={`modeDot ${canInteract ? 'interact' : isWarmingControl ? 'interact' : 'viewonly'}`} />
+            <Box className={`modeCard ${canControl ? 'interact' : 'viewonly'}`}>
+              <span className={`modeDot ${canControl ? 'interact' : 'viewonly'}`} />
               <Box sx={{ flex: 1 }}>
                 <Box className="modeTitle">
-                  {canInteract ? 'Interactive access' : isWarmingControl ? 'Preparing interactive access' : 'View-only access'}
-                  <span className="modePill">{canInteract ? 'LIVE' : isWarmingControl ? 'WARMING' : 'LOCKED'}</span>
+                  {canInteract
+                    ? 'Interactive access'
+                    : canControl
+                      ? 'Controller access'
+                      : 'View-only access'}
+                  <span className="modePill">
+                    {canInteract ? 'LIVE' : isWarmingControl ? 'WARMING' : hasControllerError ? 'ERROR' : canControl ? 'ASSIGNED' : 'LOCKED'}
+                  </span>
                 </Box>
                 <Box className="modeDesc">
                   {canInteract
                     ? 'You control touch, keys, and scroll.'
                     : isWarmingControl
                       ? 'Your control session is starting. Input is temporarily blocked.'
-                      : 'Another user is controlling this device.'}
+                      : hasControllerError
+                        ? 'You are the controller, but device input is not ready yet.'
+                        : canControl
+                          ? 'You own this control slot. Input is currently unavailable.'
+                          : 'Another user is controlling this device.'}
                 </Box>
               </Box>
             </Box>

@@ -13,10 +13,11 @@ export default function DeviceCard({
     onOpen,
 }: {
     d: CatalogDevice
-    onOpen: (deviceId: string) => void
+    onOpen: (deviceId: string, viewOnly?: boolean) => void
 }) {
     const s = statusStyle(d.status)
-    const disabled = d.status !== 'available'
+    const disabled = d.status === 'error'
+    const actionLabel = d.status === 'in_use' ? 'View' : 'Open'
 
     return (
         <Card
@@ -121,7 +122,7 @@ export default function DeviceCard({
                     fullWidth
                     variant="contained"
                     disabled={disabled}
-                    onClick={() => onOpen(d.id)}
+                    onClick={() => onOpen(d.id, d.status === 'in_use')}
                     sx={{
                         textTransform: 'none',
                         fontWeight: 500,
@@ -144,7 +145,7 @@ export default function DeviceCard({
                         },
                     }}
                 >
-                    Open
+                    {actionLabel}
                 </Button>
             </Box>
         </Card>

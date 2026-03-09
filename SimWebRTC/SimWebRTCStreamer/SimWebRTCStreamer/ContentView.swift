@@ -31,6 +31,9 @@ final class AgentApp: ObservableObject {
     private var appiumWindowRect: (width: Double, height: Double)? = nil
     private var appiumKeepAliveTimer: Timer? = nil
     private var appiumUdid: String? = nil
+    private let adb = ADBDriver()
+    private var adbSerial: String? = nil
+    private var androidDisplaySize: (width: Double, height: Double)? = nil
     private var lastPlatformStr: String = "ios"
 
     private enum AppiumLeaseState: Equatable {
@@ -63,6 +66,7 @@ final class AgentApp: ObservableObject {
         self.deviceId = config.id
         self.hostPort = hostPort
         self.appiumUdid = config.udid
+        self.adbSerial = config.adbSerial
         self.lastPlatformStr = config.platform
         self.appium.setBaseUrl(config.appiumUrl)
 
@@ -216,11 +220,17 @@ final class AgentApp: ObservableObject {
                 }
             }
 
-            // Pre-warm Appium session only when control is newly acquired by someone.
+            // iOS needs an Appium warm-up. Android can mark ready as soon as ADB is reachable.
             if gainedControl {
-                notifyInteractionState("starting")
-                Task { [weak self] in
-                    _ = await self?.ensureAppiumSession()
+                if platformIsAndroid {
+                    Task { [weak self] in
+                        await self?.ensureAndroidReady()
+                    }
+                } else {
+                    notifyInteractionState("starting")
+                    Task { [weak self] in
+                        _ = await self?.ensureAppiumSession()
+                    }
                 }
             }
 
@@ -340,6 +350,10 @@ final class AgentApp: ObservableObject {
         if appiumConsecutiveFailures >= maxTransientAppiumFailures {
             await stopAppiumSession(reason: "too-many-failures-\(reason)")
         }
+    }
+
+    private var platformIsAndroid: Bool {
+        lastPlatformStr.lowercased() == "android"
     }
     
     // MARK: - Appium control (iOS simulator)
@@ -467,13 +481,37 @@ final class AgentApp: ObservableObject {
         appiumKeepAliveTimer = nil
     }
 
+    private func ensureAndroidReady() async {
+        guard platformIsAndroid else { return }
+        guard let serial = adbSerial, !serial.isEmpty else {
+            notifyInteractionState("error", reason: "missing-adb-serial")
+            return
+        }
+
+        notifyInteractionState("starting")
+        do {
+            let size = try await adb.getDisplaySize(serial: serial)
+            androidDisplaySize = (width: Double(size.width), height: Double(size.height))
+            notifyInteractionState("ready")
+        } catch {
+            print("[adb] failed to resolve display size:", error.localizedDescription)
+            notifyInteractionState("error", reason: error.localizedDescription)
+        }
+    }
+
 
     private func toDeviceXY(xNorm: Double, yNorm: Double) -> (x: Int, y: Int)? {
-        guard let rect = appiumWindowRect else { return nil }
+        let rect: (width: Double, height: Double)?
+        if platformIsAndroid {
+            rect = androidDisplaySize
+        } else {
+            rect = appiumWindowRect
+        }
+        guard let rect else { return nil }
         guard rect.width.isFinite, rect.height.isFinite,
               rect.width > 0, rect.height > 0,
               rect.width <= Double(Int.max), rect.height <= Double(Int.max) else {
-            print("[appium] invalid window rect w=\(rect.width) h=\(rect.height); dropping pointer")
+            print("[control] invalid device rect w=\(rect.width) h=\(rect.height); dropping pointer")
             return nil
         }
 
@@ -484,7 +522,7 @@ final class AgentApp: ObservableObject {
         let yDouble = safeYNorm * rect.height
         guard xDouble.isFinite, yDouble.isFinite,
               xDouble <= Double(Int.max), yDouble <= Double(Int.max) else {
-            print("[appium] invalid pointer conversion x=\(xDouble) y=\(yDouble); dropping pointer")
+            print("[control] invalid pointer conversion x=\(xDouble) y=\(yDouble); dropping pointer")
             return nil
         }
 
@@ -496,9 +534,22 @@ final class AgentApp: ObservableObject {
     private func handlePointer(kind: String, xNorm: Double, yNorm: Double) async {
         webrtc.noteInteraction()
 
-        guard let _ = await ensureAppiumSession() else { return }
+        if platformIsAndroid {
+            guard let serial = adbSerial, !serial.isEmpty else { return }
+            if androidDisplaySize == nil {
+                do {
+                    let size = try await adb.getDisplaySize(serial: serial)
+                    androidDisplaySize = (width: Double(size.width), height: Double(size.height))
+                } catch {
+                    print("[adb] ❌ display size failed:", error.localizedDescription)
+                    return
+                }
+            }
+        } else {
+            guard let _ = await ensureAppiumSession() else { return }
+        }
         guard toDeviceXY(xNorm: xNorm, yNorm: yNorm) != nil else {
-            print("[appium] ⚠️ no window rect yet; dropping pointer")
+            print("[control] ⚠️ no device rect yet; dropping pointer")
             return
         }
 
@@ -525,31 +576,51 @@ final class AgentApp: ObservableObject {
             let TAP_THRESH = 0.02
 
             if dist <= TAP_THRESH {
-                guard let xy = toDeviceXY(xNorm: end.x, yNorm: end.y),
-                      let sid = appiumSessionId else { return }
-                do {
-                    try await appium.tap(sessionId: sid, x: xy.x, y: xy.y)
-                    recordAppiumSuccess()
-                    print("[appium] tap x=\(xy.x) y=\(xy.y)")
-                } catch {
-                    print("[appium] ❌ tap failed:", error.localizedDescription)
-                    await recordAppiumFailure("tap")
+                guard let xy = toDeviceXY(xNorm: end.x, yNorm: end.y) else { return }
+                if platformIsAndroid {
+                    guard let serial = adbSerial else { return }
+                    do {
+                        try await adb.tap(serial: serial, x: xy.x, y: xy.y)
+                        print("[adb] tap x=\(xy.x) y=\(xy.y)")
+                    } catch {
+                        print("[adb] ❌ tap failed:", error.localizedDescription)
+                    }
+                } else {
+                    guard let sid = appiumSessionId else { return }
+                    do {
+                        try await appium.tap(sessionId: sid, x: xy.x, y: xy.y)
+                        recordAppiumSuccess()
+                        print("[appium] tap x=\(xy.x) y=\(xy.y)")
+                    } catch {
+                        print("[appium] ❌ tap failed:", error.localizedDescription)
+                        await recordAppiumFailure("tap")
+                    }
                 }
             } else {
                 guard let startXY = toDeviceXY(xNorm: down.x, yNorm: down.y),
-                      let endXY = toDeviceXY(xNorm: end.x, yNorm: end.y),
-                      let sid = appiumSessionId else { return }
+                      let endXY = toDeviceXY(xNorm: end.x, yNorm: end.y) else { return }
 
                 let dt = max(0.08, min(0.8, now - down.t))
                 let ms = Int(dt * 1000)
 
-                do {
-                    try await appium.swipe(sessionId: sid, x1: startXY.x, y1: startXY.y, x2: endXY.x, y2: endXY.y, durationMs: ms)
-                    recordAppiumSuccess()
-                    print("[appium] swipe (\(startXY.x),\(startXY.y)) -> (\(endXY.x),\(endXY.y)) ms=\(ms)")
-                } catch {
-                    print("[appium] ❌ swipe failed:", error.localizedDescription)
-                    await recordAppiumFailure("swipe")
+                if platformIsAndroid {
+                    guard let serial = adbSerial else { return }
+                    do {
+                        try await adb.swipe(serial: serial, x1: startXY.x, y1: startXY.y, x2: endXY.x, y2: endXY.y, durationMs: ms)
+                        print("[adb] swipe (\(startXY.x),\(startXY.y)) -> (\(endXY.x),\(endXY.y)) ms=\(ms)")
+                    } catch {
+                        print("[adb] ❌ swipe failed:", error.localizedDescription)
+                    }
+                } else {
+                    guard let sid = appiumSessionId else { return }
+                    do {
+                        try await appium.swipe(sessionId: sid, x1: startXY.x, y1: startXY.y, x2: endXY.x, y2: endXY.y, durationMs: ms)
+                        recordAppiumSuccess()
+                        print("[appium] swipe (\(startXY.x),\(startXY.y)) -> (\(endXY.x),\(endXY.y)) ms=\(ms)")
+                    } catch {
+                        print("[appium] ❌ swipe failed:", error.localizedDescription)
+                        await recordAppiumFailure("swipe")
+                    }
                 }
             }
 
@@ -562,6 +633,17 @@ final class AgentApp: ObservableObject {
         webrtc.noteInteraction()
 
         guard !text.isEmpty else { return }
+        if platformIsAndroid {
+            guard let serial = adbSerial else { return }
+            do {
+                try await adb.sendText(serial: serial, text: text)
+                print("[adb] text len=\(text.count)")
+            } catch {
+                print("[adb] ❌ text failed:", error.localizedDescription)
+            }
+            return
+        }
+
         guard let sid = await ensureAppiumSession() else { return }
         do {
             try await appium.sendKeys(sessionId: sid, text: text)
@@ -588,6 +670,21 @@ final class AgentApp: ObservableObject {
             return
         }
 
+        if platformIsAndroid {
+            guard let serial = adbSerial else { return }
+            do {
+                if let keyCode = ADBDriver.androidKeyCode(code: code, key: key) {
+                    try await adb.sendKeyEvent(serial: serial, keyCode: keyCode)
+                } else if !key.isEmpty {
+                    try await adb.sendText(serial: serial, text: key)
+                }
+                print("[adb] key code=\(code) key=\(key)")
+            } catch {
+                print("[adb] ❌ key failed:", error.localizedDescription)
+            }
+            return
+        }
+
         guard let sid = await ensureAppiumSession() else { return }
 
         let v = AppiumDriver.specialKeyValue(code: code, key: key) ?? key
@@ -603,6 +700,17 @@ final class AgentApp: ObservableObject {
     
     private func handleHome() async {
         webrtc.noteInteraction()
+
+        if platformIsAndroid {
+            guard let serial = adbSerial else { return }
+            do {
+                try await adb.pressHome(serial: serial)
+                print("[adb] home pressed")
+            } catch {
+                print("[adb] ❌ home failed:", error.localizedDescription)
+            }
+            return
+        }
 
         guard let sid = await ensureAppiumSession() else { return }
         do {
@@ -888,12 +996,199 @@ final class AppiumDriver {
     }
 }
 
+final class ADBDriver {
+    struct DisplaySize {
+        let width: Int
+        let height: Int
+    }
+
+    enum ADBError: Error, LocalizedError {
+        case adbNotFound
+        case commandFailed(String)
+        case badResponse(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .adbNotFound:
+                return "adb not found"
+            case .commandFailed(let message):
+                return message
+            case .badResponse(let message):
+                return message
+            }
+        }
+    }
+
+    func getDisplaySize(serial: String) async throws -> DisplaySize {
+        let output = try await run(serial: serial, args: ["shell", "wm", "size"])
+        let numbers = output
+            .components(separatedBy: CharacterSet.decimalDigits.inverted)
+            .compactMap { Int($0) }
+        if numbers.count >= 2 {
+            return DisplaySize(width: numbers[0], height: numbers[1])
+        }
+        throw ADBError.badResponse("missing display size in output: \(output)")
+    }
+
+    func tap(serial: String, x: Int, y: Int) async throws {
+        _ = try await run(serial: serial, args: ["shell", "input", "tap", String(x), String(y)])
+    }
+
+    func swipe(serial: String, x1: Int, y1: Int, x2: Int, y2: Int, durationMs: Int) async throws {
+        _ = try await run(serial: serial, args: [
+            "shell", "input", "swipe",
+            String(x1), String(y1), String(x2), String(y2), String(max(50, durationMs))
+        ])
+    }
+
+    func sendText(serial: String, text: String) async throws {
+        let escaped = escapeText(text)
+        guard !escaped.isEmpty else { return }
+        _ = try await run(serial: serial, args: ["shell", "input", "text", escaped])
+    }
+
+    func sendKeyEvent(serial: String, keyCode: Int) async throws {
+        _ = try await run(serial: serial, args: ["shell", "input", "keyevent", String(keyCode)])
+    }
+
+    func pressHome(serial: String) async throws {
+        try await sendKeyEvent(serial: serial, keyCode: 3)
+    }
+
+    static func androidKeyCode(code: String, key: String) -> Int? {
+        switch code {
+        case "Enter", "NumpadEnter": return 66
+        case "Backspace": return 67
+        case "Tab": return 61
+        case "Escape": return 111
+        case "ArrowLeft": return 21
+        case "ArrowUp": return 19
+        case "ArrowRight": return 22
+        case "ArrowDown": return 20
+        case "Delete": return 112
+        case "Home": return 3
+        default: break
+        }
+        switch key {
+        case "Enter": return 66
+        case "Backspace": return 67
+        case "Tab": return 61
+        case "Escape": return 111
+        default: return nil
+        }
+    }
+
+    private func escapeText(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: " ", with: "%s")
+            .replacingOccurrences(of: "&", with: "\\&")
+            .replacingOccurrences(of: "<", with: "\\<")
+            .replacingOccurrences(of: ">", with: "\\>")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "'", with: "\\'")
+            .replacingOccurrences(of: "(", with: "\\(")
+            .replacingOccurrences(of: ")", with: "\\)")
+    }
+
+    private func run(serial: String, args: [String]) async throws -> String {
+        let adbPath = try resolveADBPath()
+        print("[adb] using path:", adbPath)
+        return try await withCheckedThrowingContinuation { continuation in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: adbPath)
+            process.arguments = ["-s", serial] + args
+
+            let outputPipe = Pipe()
+            let errorPipe = Pipe()
+            process.standardOutput = outputPipe
+            process.standardError = errorPipe
+
+            process.terminationHandler = { proc in
+                let out = String(data: outputPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                let err = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                if proc.terminationStatus == 0 {
+                    continuation.resume(returning: out.trimmingCharacters(in: .whitespacesAndNewlines))
+                } else {
+                    continuation.resume(throwing: ADBError.commandFailed("adb failed (\(proc.terminationStatus)): \(err.isEmpty ? out : err)"))
+                }
+            }
+
+            do {
+                try process.run()
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
+    private func resolveADBPath() throws -> String {
+        let candidates = adbPathCandidates()
+
+        let fm = FileManager.default
+        for candidate in candidates {
+            let resolved = URL(fileURLWithPath: candidate).resolvingSymlinksInPath().path
+            if fm.fileExists(atPath: candidate) {
+                return candidate
+            }
+            if resolved != candidate, fm.fileExists(atPath: resolved) {
+                return resolved
+            }
+        }
+
+        if let discovered = try? discoverADBOnPath(), !discovered.isEmpty {
+            let resolved = URL(fileURLWithPath: discovered).resolvingSymlinksInPath().path
+            if fm.fileExists(atPath: discovered) {
+                return discovered
+            }
+            if fm.fileExists(atPath: resolved) {
+                return resolved
+            }
+        }
+
+        print("[adb] no executable found; candidates=", candidates)
+        throw ADBError.adbNotFound
+    }
+
+    private func discoverADBOnPath() throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+        process.arguments = ["adb"]
+
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = Pipe()
+
+        try process.run()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 else { return "" }
+        let out = String(data: outputPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func adbPathCandidates() -> [String] {
+        let env = ProcessInfo.processInfo.environment
+        let realHome = FileManager.default.homeDirectoryForCurrentUser.path
+        return [
+            env["ADB_PATH"],
+            env["ANDROID_SDK_ROOT"].map { "\($0)/platform-tools/adb" },
+            env["ANDROID_HOME"].map { "\($0)/platform-tools/adb" },
+            "\(realHome)/Library/Android/sdk/platform-tools/adb",
+            "\(NSHomeDirectory())/Library/Android/sdk/platform-tools/adb",
+            "/opt/homebrew/bin/adb",
+            "/usr/local/bin/adb"
+        ]
+        .compactMap { $0 }
+    }
+}
+
 
 struct DeviceConfig: Identifiable {
     let id: String      // MUST match device.id in devices.ts / server side
     let label: String   // Human-friendly name
     let platform: String  // "ios" or "android"
     let udid: String?     // iOS simulator UDID (required for Appium control on iOS)
+    let adbSerial: String? // Android emulator/device serial used by adb
     let appiumUrl: String // e.g. "http://127.0.0.1:4723"
 
     var deviceId: String { id }
@@ -963,10 +1258,10 @@ struct ContentView: View {
     // These deviceIds MUST match what your web client / server uses
     // for this host (see devices.ts on the Node side).
     private let devices: [DeviceConfig] = [
-        DeviceConfig(id: "sim-ios-16-pro",     label: "iPhone 16 Pro (sim)", platform: "ios", udid: "9DBCF8EC-9376-480F-8962-582E653696BC", appiumUrl: "http://127.0.0.1:4723"),
-        DeviceConfig(id: "sim-ios-16-pro-max", label: "iPhone 16 Pro Max (sim)", platform: "ios", udid: "6CFB845C-E7B4-4542-9A7D-22A7E9B954B8", appiumUrl: "http://127.0.0.1:4723"),
-        DeviceConfig(id: "sim-android-1",      label: "Android Emulator #1", platform: "android", udid: nil, appiumUrl: "http://127.0.0.1:4723"),
-        DeviceConfig(id: "sim-android-2",      label: "Android Emulator #2", platform: "android", udid: nil, appiumUrl: "http://127.0.0.1:4723"),
+        DeviceConfig(id: "sim-ios-16-pro",     label: "iPhone 16 Pro (sim)", platform: "ios", udid: "9DBCF8EC-9376-480F-8962-582E653696BC", adbSerial: nil, appiumUrl: "http://127.0.0.1:4723"),
+        DeviceConfig(id: "sim-ios-16-pro-max", label: "iPhone 16 Pro Max (sim)", platform: "ios", udid: "6CFB845C-E7B4-4542-9A7D-22A7E9B954B8", adbSerial: nil, appiumUrl: "http://127.0.0.1:4723"),
+        DeviceConfig(id: "sim-android-1",      label: "Android Emulator #1", platform: "android", udid: nil, adbSerial: "emulator-5554", appiumUrl: "http://127.0.0.1:4723"),
+        DeviceConfig(id: "sim-android-2",      label: "Android Emulator #2", platform: "android", udid: nil, adbSerial: "emulator-5556", appiumUrl: "http://127.0.0.1:4723"),
     ]
 
     var body: some View {

@@ -171,7 +171,7 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
             // During active touch input, trade a bit of sharpness for smoother motion.
             for (viewerId, pc) in self.pcs {
                 if let state = self.tuneByViewer[viewerId] {
-                    let boostedBitrate = max(state.maxBitrateBps, Int(Double(state.baselineMaxBitrateBps) * 1.25))
+                    let boostedBitrate = max(state.maxBitrateBps, self.scaledBitrate(state.baselineMaxBitrateBps, factor: 1.25))
                     let boostedFramerate = max(state.maxFramerate, 30)
                     self.applyTune(viewerId: viewerId,
                                    pc: pc,
@@ -195,6 +195,15 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
             t.resume()
             self.interactionTimer = t
         }
+    }
+
+    private func scaledBitrate(_ bitrate: Int, factor: Double) -> Int {
+        let safeBitrate = max(0, bitrate)
+        let scaled = Double(safeBitrate) * factor
+        if !scaled.isFinite || scaled >= Double(Int.max) {
+            return safeBitrate
+        }
+        return max(safeBitrate, Int(scaled.rounded(.down)))
     }
 
     /// After a short idle period, restore crisp text by snapping back to baseline bitrate/fps
@@ -803,8 +812,6 @@ final class WebRTCManager: NSObject, RTCPeerConnectionDelegate, RTCDataChannelDe
         } else {
             tuneByViewer[viewerId]?.maxBitrateBps = maxBitrateBps
             tuneByViewer[viewerId]?.maxFramerate = maxFramerate
-            tuneByViewer[viewerId]?.baselineMaxBitrateBps = maxBitrateBps
-            tuneByViewer[viewerId]?.baselineMaxFramerate = maxFramerate
         }
 
         print("[webrtc] sender tuned viewer=\(viewerId) maxBitrate=\(maxBitrateBps) fps=\(maxFramerate) interaction=\(interactionActive ? "on" : "off")")

@@ -20,7 +20,7 @@ import type { CatalogDevice } from './devicesCatalog'
 type PlatformFilter = 'all' | 'android' | 'ios'
 type AvailabilityFilter = 'all' | 'available' | 'in_use' | 'error'
 
-export default function DeviceCatalog({ onOpen }: { onOpen: (deviceId: string) => void }) {
+export default function DeviceCatalog({ onOpen }: { onOpen: (deviceId: string, viewOnly?: boolean) => void }) {
   const [q, setQ] = useState('')
   const [platform, setPlatform] = useState<PlatformFilter>('all')
   const [availability, setAvailability] = useState<AvailabilityFilter>('all')
