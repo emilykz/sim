@@ -957,7 +957,7 @@ struct DeviceRowView: View {
 
 struct ContentView: View {
     // Signaling host:port for THIS Mac
-    private let hostPort = "192.168.86.25:8080" // adjust if needed
+    private let hostPort = "192.168.86.28:8080" // adjust if needed
 
     // ⚠️ IMPORTANT:
     // These deviceIds MUST match what your web client / server uses

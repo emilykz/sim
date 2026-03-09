@@ -386,6 +386,22 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
     },
     [applyLayout, registerActivity]
   )
+  const computeFrameRef = useRef(computeFrame)
+  const applyLayoutRef = useRef(applyLayout)
+  const applyZoomRef = useRef(applyZoom)
+  const updateFitScaleRef = useRef(updateFitScale)
+  useEffect(() => {
+    computeFrameRef.current = computeFrame
+  }, [computeFrame])
+  useEffect(() => {
+    applyLayoutRef.current = applyLayout
+  }, [applyLayout])
+  useEffect(() => {
+    applyZoomRef.current = applyZoom
+  }, [applyZoom])
+  useEffect(() => {
+    updateFitScaleRef.current = updateFitScale
+  }, [updateFitScale])
 
   // ✅ Fit: auto-fit to view (device + bezel)
   const fitToWindow = useCallback(() => {
@@ -833,15 +849,15 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
       const raw = Math.min(availW / frameW, availH / frameH)
       const s = Math.min(AUTO_MAX_FIT, raw)
       const clamped = clamp(s, ZMIN, ZMAX)
-      updateFitScale(clamped)
-      applyZoom(clamped, 'auto')
+      updateFitScaleRef.current(clamped)
+      applyZoomRef.current(clamped, 'auto')
     }
 
     const resizeObserver = new ResizeObserver(() => {
       if (!isActiveRef.current) return
       if (userZoomedRef.current) return
 
-      const geom = computeFrame()
+      const geom = computeFrameRef.current()
       if (geom) doAutoFit(geom.frameW, geom.frameH)
     })
     resizeObserver.observe(view)
@@ -853,9 +869,9 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
 
       setBaseSizeOnce(w, h)
 
-      const geom = computeFrame()
+      const geom = computeFrameRef.current()
       if (geom) {
-        applyLayout(scaleRef.current)
+        applyLayoutRef.current(scaleRef.current)
         setLayoutReady(true)
       }
       if (!didAutoFit && !userZoomedRef.current && geom) {
@@ -873,7 +889,7 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
     const onResize = () => {
       if (!isActiveRef.current) return
       if (userZoomedRef.current) return
-      const geom = computeFrame()
+      const geom = computeFrameRef.current()
       if (geom) doAutoFit(geom.frameW, geom.frameH)
     }
     window.addEventListener('resize', onResize)
@@ -941,7 +957,7 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
       startedRef.current = false
       offerSentRef.current = false
     }
-  }, [deviceId, device, applyZoom, setBaseSizeOnce, applyLayout, computeFrame, updateFitScale, stopStreamingTransport])
+  }, [deviceId, device, setBaseSizeOnce, stopStreamingTransport])
 
   // Re-apply layout whenever bezel loads
   useEffect(() => {
