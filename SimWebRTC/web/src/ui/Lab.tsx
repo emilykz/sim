@@ -16,6 +16,7 @@ type Session = {
   mode: SessionMode
   openedAt: number
   connectionState: SessionConnectionState
+  resumeOnly: boolean
 }
 
 // localStorage keys
@@ -51,16 +52,17 @@ export default function Lab() {
       const parsed = raw ? JSON.parse(raw) : []
       return Array.isArray(parsed)
         ? parsed
-            .filter((s: any) => s?.deviceId && s?.name && s?.platform && s?.mode)
-            .map((s: any) => ({
-              sessionId: String(s.sessionId || createSessionId()),
-              deviceId: String(s.deviceId),
-              name: String(s.name),
-              platform: s.platform === 'android' ? 'android' : 'ios',
-              mode: s.mode === 'watch' ? 'watch' : 'manual',
-              openedAt: Number(s.openedAt || Date.now()),
-              connectionState: 'parked' as SessionConnectionState,
-            }))
+          .filter((s: any) => s?.deviceId && s?.name && s?.platform && s?.mode)
+          .map((s: any) => ({
+            sessionId: String(s.sessionId || createSessionId()),
+            deviceId: String(s.deviceId),
+            name: String(s.name),
+            platform: s.platform === 'android' ? 'android' : 'ios',
+            mode: s.mode === 'watch' ? 'watch' : 'manual',
+            openedAt: Number(s.openedAt || Date.now()),
+            connectionState: 'parked' as SessionConnectionState,
+            resumeOnly: true,
+          }))
         : []
     } catch {
       return []
@@ -154,10 +156,11 @@ export default function Lab() {
         return prev.map((s) =>
           s.deviceId === deviceId
             ? {
-                ...s,
-                mode,
-                connectionState: 'live',
-              }
+              ...s,
+              mode,
+              connectionState: 'live',
+              resumeOnly: s.connectionState === 'parked' ? s.resumeOnly : false,
+            }
             : s
         )
       }
@@ -170,6 +173,7 @@ export default function Lab() {
         mode,
         openedAt: Date.now(),
         connectionState: 'live',
+        resumeOnly: false,
       }
       return [next, ...prev]
     })
@@ -200,7 +204,7 @@ export default function Lab() {
     setSessions((prev) =>
       prev.map((s) =>
         s.deviceId === deviceId && s.connectionState === 'parked'
-          ? { ...s, connectionState: 'live' }
+          ? { ...s, connectionState: 'live', resumeOnly: true }
           : s
       )
     )
@@ -389,6 +393,16 @@ export default function Lab() {
                     clientSessionId={session.sessionId}
                     isActive={active}
                     viewOnly={session.mode === 'watch'}
+                    resumeOnly={session.resumeOnly}
+                    onResumeAccepted={() => {
+                      setSessions((prev) =>
+                        prev.map((s) =>
+                          s.deviceId === session.deviceId
+                            ? { ...s, resumeOnly: false }
+                            : s
+                        )
+                      )
+                    }}
                     onReleased={(info) => {
                       closeSession(session.deviceId)
                       setViewMode('catalog')

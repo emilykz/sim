@@ -389,6 +389,7 @@ wssViewers.on("connection", (ws, req) => {
 
       const requestedMode = msg.mode === "watch" ? "watch" : "manual";
       const clientSessionId = typeof msg.clientSessionId === "string" ? msg.clientSessionId : null;
+      const resumeOnly = !!msg.resumeOnly;
       const reclaim = getValidReclaim(deviceId);
       const currentController = getController(deviceId);
       const automationRunning = automationRunningByDevice.has(deviceId);
@@ -413,6 +414,10 @@ wssViewers.on("connection", (ws, req) => {
       } else if (reclaimMatches) {
         effectiveMode = "manual";
       } else if (reclaimReservedForSomeoneElse) {
+        effectiveMode = "watch";
+      } else if (requestedMode === "manual" && resumeOnly) {
+        // Resume attempt failed because preserved lease no longer exists.
+        // Do not silently grant a brand new manual lease.
         effectiveMode = "watch";
       } else {
         effectiveMode = requestedMode === "manual" ? "manual" : "watch";
@@ -441,8 +446,12 @@ wssViewers.on("connection", (ws, req) => {
       const resumeRejected =
         requestedMode === "manual" &&
         !!clientSessionId &&
-        !reclaimMatches &&
-        (currentController || reclaimReservedForSomeoneElse || automationRunning);
+        (
+          (resumeOnly && !reclaimMatches) ||
+          currentController ||
+          reclaimReservedForSomeoneElse ||
+          automationRunning
+        );
 
       const currentStatus = getDeviceStatus(deviceId);
 
@@ -459,19 +468,31 @@ wssViewers.on("connection", (ws, req) => {
           : null;
 
 
-          send(ws, {
-            type: "viewer-id",
-            deviceId,
-            viewerId,
-            mode: effectiveMode,
-            deviceStatus: currentStatus,
-            resumeRejected,
-            resumeReason: resumeRejected ? "taken_by_other_user" : null,
-            sessionTimeoutMs: effectiveMode === "manual" ? SESSION_INACTIVITY_MS : null,
-            lastActivityMs: resumedLastActivityMs ?? null,
-            remainingMs,
-            resumedFromPreservedLease: reclaimMatches,
-          });
+      let resumeReason = null;
+      if (resumeRejected) {
+        if (automationRunning) {
+          resumeReason = "automation_running";
+        } else if (currentController || reclaimReservedForSomeoneElse) {
+          resumeReason = "taken_by_other_user";
+        } else if (resumeOnly && !reclaimMatches) {
+          resumeReason = "session_expired";
+        }
+      }
+
+
+      send(ws, {
+        type: "viewer-id",
+        deviceId,
+        viewerId,
+        mode: effectiveMode,
+        deviceStatus: currentStatus,
+        resumeRejected,
+        resumeReason,
+        sessionTimeoutMs: effectiveMode === "manual" ? SESSION_INACTIVITY_MS : null,
+        lastActivityMs: resumedLastActivityMs ?? null,
+        remainingMs,
+        resumedFromPreservedLease: reclaimMatches,
+      });
 
       send(ws, { type: "agent-state", deviceId, online: agents.has(deviceId) });
       notifyViewerCount(deviceId);

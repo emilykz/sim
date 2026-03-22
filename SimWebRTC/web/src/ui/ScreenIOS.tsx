@@ -66,13 +66,14 @@ function pickBezelKind(deviceName: string): keyof typeof BEZELS {
   if (n.includes('max')) return 'proMax'
   return 'pro'
 }
-
 type ScreenIOSProps = {
-  deviceId?: string
+  deviceId: string
   clientSessionId: string
-  isActive?: boolean
+  isActive: boolean
   viewOnly?: boolean
-  onReleased?: (info: { reason: string; silent?: boolean }) => void
+  resumeOnly?: boolean
+  onResumeAccepted?: () => void
+  onReleased?: (info?: any) => void
 }
 
 export default function ScreenIOS(props: ScreenIOSProps) {
@@ -516,6 +517,7 @@ export default function ScreenIOS(props: ScreenIOSProps) {
             clientSessionId: props.clientSessionId,
             mode: props.viewOnly ? 'watch' : 'manual',
             viewOnly: !!props.viewOnly,
+            resumeOnly: !!props.resumeOnly,
           })
         )
       }
@@ -548,12 +550,30 @@ export default function ScreenIOS(props: ScreenIOSProps) {
             setRemainingInactivityMs(null)
           }
 
-          if (msg.resumeRejected && msg.resumeReason === 'taken_by_other_user') {
-            releaseActionReasonRef.current = 'resume_failed_taken_by_other_user'
-            releaseReasonRef.current = 'Control could not be resumed because another user took the device'
-            setReleaseOverlay('Control could not be resumed because another user took the device')
+          if (msg.resumeRejected) {
+            let message = 'Control could not be resumed.'
+
+            if (msg.resumeReason === 'taken_by_other_user') {
+              releaseActionReasonRef.current = 'resume_failed_taken_by_other_user'
+              message = 'Control could not be resumed because another user took the device'
+            } else if (msg.resumeReason === 'session_expired') {
+              releaseActionReasonRef.current = 'resume_failed_session_expired'
+              message = 'Control could not be resumed because the session expired due to inactivity'
+            } else if (msg.resumeReason === 'automation_running') {
+              releaseActionReasonRef.current = 'resume_failed_automation_running'
+              message = 'Control could not be resumed because automation is running on this device'
+            } else {
+              releaseActionReasonRef.current = 'resume_failed'
+            }
+
+            releaseReasonRef.current = message
+            setReleaseOverlay(message)
             stopStreamingTransport()
             return
+          }
+
+          if (!msg.resumeRejected && props.onResumeAccepted) {
+            props.onResumeAccepted()
           }
 
 
