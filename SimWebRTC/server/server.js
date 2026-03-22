@@ -2,50 +2,51 @@ import http from "http";
 import { WebSocketServer } from "ws";
 import crypto from "crypto";
 
-//Listening port
+// Listening port
 const PORT = 8080;
 
-//Max inboud message payload size 
+// Max inbound message payload size
 const MAX_MSG_BYTES = 256 * 1024;
 
-//Heartbeat sweeper interval timer (30 secs)
+// Heartbeat sweeper interval timer (30 secs)
 const HEARTBEAT_MS = 30000;
 
-// If a viewer connection has no heartbeats  or traffic for 2 mins, treat as dead and clean up
-const VIEWER_LIVENESS_TTL_MS = 120000; 
+// If a viewer connection has no heartbeats or traffic for 2 mins, treat as dead and clean up
+const VIEWER_LIVENESS_TTL_MS = 120000;
 
-//Runs liveness sweep every 5 seconds 
+// Runs liveness sweep every 5 seconds
 const VIEWER_SWEEP_MS = 5000;
 
-// Session inactivity 
-const SESSION_INACTIVITY_MS = 15 * 60 * 1000; // 15 minutes
-const SESSION_SWEEP_MS = 10000; // sweep every  10s
-const RELEASE_CONTROLLER_ONLY = true; // keep watchers; release only controller
+// Session inactivity
+const SESSION_INACTIVITY_MS = 60 * 1000; // 60 seconds for testing
+const SESSION_SWEEP_MS = 10000; // sweep every 10s
 
-// Map of active capture agent WebSockets for each device id 
-// Ex: {"iPhone 16 Pro": <WebSocket#111>} 
+// Map of active capture agent WebSockets for each device id
 const agents = new Map();
 
 // Maps each device ID to another Map of viewers (viewer id -> viewer WS)
-// Ex: {"iPhone 16 Pro" : { "viewerOne": <WebSocket#111">, "viewerTwo": <WebSocket#222>} }
 const viewersByDevice = new Map();
 
-// Stores metadata by the viewer WS ..... { device ID, viewer id, lastSeen<s, lastActivityMs}
-// Ex: { <WebSocket#111> : { deviceId: "IPhone 16  Pro", viewerId: "viewerOne", lastSeenMS...}}
+// Stores metadata by viewer WS
+// { deviceId, viewerId, clientSessionId, mode, lastSeenMs, lastActivityMs }
 const viewerMeta = new Map();
 
-// A map that tracks which viewerID currently owns control for each device ID 
-// Ex: {"iPhone 16 Pro": "null", "iPhone 16 Pro Max": "viewerOne"} 
+// Tracks which viewer currently owns manual control for a device
 const controllerByDevice = new Map();
 
-// Tracks whether the current controller is warming/ready/error for interaction
+// Tracks current interaction state (starting / ready / error / idle) per device
 const interactionStateByDevice = new Map();
 
+// Preserved manual lease across reload/disconnect.
+// deviceId -> { clientSessionId, lastActivityMs, preservedAtMs }
+const reclaimableControllerByDevice = new Map();
 
-/** 
+// Placeholder for future automation-run occupancy.
+const automationRunningByDevice = new Set();
+
+/**
  * Broadcast a message to all viewers watching this device
- * Used for control state updates, stop  stream, agent updates, etc
-*/
+ */
 function broadcastToViewers(deviceId, msg) {
   const viewersForThisDevice = viewersByDevice.get(deviceId);
   if (!viewersForThisDevice) return;
@@ -53,7 +54,6 @@ function broadcastToViewers(deviceId, msg) {
     send(viewer, msg);
   }
 }
-
 
 function getController(deviceId) {
   const id = controllerByDevice.get(deviceId);
@@ -88,68 +88,39 @@ function setController(deviceId, viewerIdOrNull) {
 
   if (viewerIdOrNull) {
     controllerByDevice.set(deviceId, viewerIdOrNull);
+    reclaimableControllerByDevice.delete(deviceId);
   } else {
     controllerByDevice.delete(deviceId);
   }
 
   const controllerId = viewerIdOrNull ?? null;
 
-  // Controller ownership changed, so reset readiness until agent says otherwise.
   if (controllerId) {
     interactionStateByDevice.set(deviceId, { state: "starting" });
   } else {
     interactionStateByDevice.delete(deviceId);
   }
 
-  // Notify all viewers so they can update their "canInteract" UI
   broadcastToViewers(deviceId, { type: "control-state", deviceId, controllerId });
   broadcastToViewers(deviceId, {
     type: "interaction-state",
     deviceId,
-    state: controllerId ? "starting" : "idle"
+    state: controllerId ? "starting" : "idle",
   });
 
-  // Also notify the agent so it can enforce control server-side if desired
   const agent = agents.get(deviceId);
   if (agent) {
     send(agent, { type: "control-state", deviceId, controllerId });
     send(agent, {
       type: "interaction-state",
       deviceId,
-      state: controllerId ? "starting" : "idle"
+      state: controllerId ? "starting" : "idle",
     });
   }
 }
 
-function markAlive(ws) { 
-  ws.isAlive = true; 
-}
-
-// ---- Static device catalog (temporary) ----
-const DEVICE_CATALOG = [
-  { id: "sim-ios-16-pro",     name: "iPhone 16 Pro",       platform: "ios",     osVersion: "18.3.1" },
-  { id: "sim-ios-16-pro-max", name: "iPhone 16 Pro Max",   platform: "ios",     osVersion: "18.3.1" },
-  { id: "sim-android-1",      name: "Android Emulator #1", platform: "android", osVersion: "14" },
-  { id: "sim-android-2",      name: "Android Emulator #2", platform: "android", osVersion: "14" },
-];
-
-// status rules (simple)
-function getDeviceStatus(deviceId) {
-  const controllerId = getController(deviceId);
-  if (controllerId) return "in_use";
-  const agentOnline = agents.has(deviceId);
-  if (!agentOnline) return "error";
-  return "available";
-}
-
-function getDeviceCatalogSnapshot() {
-  return DEVICE_CATALOG.map((d) => ({
-    ...d,
-    status: getDeviceStatus(d.id),
-    controllerId: getController(d.id),
-    agentOnline: agents.has(d.id),
-    viewerCount: viewerCount(d.id),
-  }));
+function markAlive(ws) {
+  ws.isAlive = true;
 }
 
 function send(ws, obj) {
@@ -176,27 +147,139 @@ function notifyViewerCount(deviceId) {
   send(agent, { type: "viewer-count", deviceId, count: viewerCount(deviceId) });
 }
 
-function detachViewer(deviceId, viewerId, reason = "") {
+function isLeaseStillActive(lastActivityMs) {
+  if (!lastActivityMs) return false;
+  return Date.now() - lastActivityMs <= SESSION_INACTIVITY_MS;
+}
+
+function getValidReclaim(deviceId) {
+  const reclaim = reclaimableControllerByDevice.get(deviceId);
+  if (!reclaim) return null;
+
+  if (!isLeaseStillActive(reclaim.lastActivityMs)) {
+    reclaimableControllerByDevice.delete(deviceId);
+    return null;
+  }
+
+  return reclaim;
+}
+
+function touchViewerSeenByWs(ws) {
+  const meta = viewerMeta.get(ws);
+  if (!meta) return;
+  meta.lastSeenMs = Date.now();
+}
+
+function touchViewerActivityByViewerId(deviceId, viewerId) {
+  const m = viewersByDevice.get(deviceId);
+  const ws = m?.get(viewerId);
+  if (!ws) return false;
+
+  const meta = viewerMeta.get(ws);
+  if (!meta) return false;
+
+  const now = Date.now();
+  meta.lastSeenMs = now;
+  meta.lastActivityMs = now;
+  return true;
+}
+
+// ---- Static device catalog (temporary) ----
+const DEVICE_CATALOG = [
+  { id: "sim-ios-16-pro", name: "iPhone 16 Pro", platform: "ios", osVersion: "18.3.1" },
+  { id: "sim-ios-16-pro-max", name: "iPhone 16 Pro Max", platform: "ios", osVersion: "18.3.1" },
+  { id: "sim-android-1", name: "Android Emulator #1", platform: "android", osVersion: "14" },
+  { id: "sim-android-2", name: "Android Emulator #2", platform: "android", osVersion: "14" },
+];
+
+function getDeviceStatus(deviceId) {
+  if (automationRunningByDevice.has(deviceId)) return "automation_running";
+
+  const controllerId = getController(deviceId);
+  if (controllerId) return "manual_in_use";
+
+  const reclaim = getValidReclaim(deviceId);
+  if (reclaim) return "manual_in_use";
+
+  const agentOnline = agents.has(deviceId);
+  if (!agentOnline) return "error";
+
+  return "available";
+}
+
+function getDeviceCatalogSnapshot() {
+  return DEVICE_CATALOG.map((d) => ({
+    ...d,
+    status: getDeviceStatus(d.id),
+    controllerId: getController(d.id),
+    agentOnline: agents.has(d.id),
+    viewerCount: viewerCount(d.id),
+  }));
+}
+
+function detachViewer(deviceId, viewerId, reason = "", opts = {}) {
   if (!deviceId || !viewerId) return;
+
+  const { preserveReclaim = false } = opts;
 
   const m = viewersByDevice.get(deviceId);
   const vws = m?.get(viewerId);
+  const meta = vws ? viewerMeta.get(vws) : null;
+
   if (vws) {
-    // Mark so that if ws "close" fires later we don't double-handle
     vws._viewerDetached = true;
-    viewerMeta.delete(vws); //delete metadata so no more sweeps and checks 
-    try { vws.terminate(); } catch {} //terminate WS
+    viewerMeta.delete(vws);
+    try {
+      vws.terminate();
+    } catch { }
   }
 
-  //Deletes the viewer from view list 
   if (m) {
-    m.delete(viewerId); 
+    m.delete(viewerId);
     if (m.size === 0) viewersByDevice.delete(deviceId);
   }
 
-  // If this viewer was the current controller, clear controller for this device.
-  if (getController(deviceId) === viewerId) {
-    setController(deviceId, null);   
+  const wasController = getController(deviceId) === viewerId;
+
+  if (wasController) {
+    const canPreserve =
+      preserveReclaim &&
+      meta &&
+      meta.mode === "manual" &&
+      meta.clientSessionId &&
+      meta.lastActivityMs &&
+      isLeaseStillActive(meta.lastActivityMs);
+
+    if (canPreserve) {
+      reclaimableControllerByDevice.set(deviceId, {
+        clientSessionId: meta.clientSessionId,
+        lastActivityMs: meta.lastActivityMs,
+        preservedAtMs: Date.now(),
+      });
+
+      console.log("[reclaim] preserved manual lease", {
+        deviceId,
+        viewerId,
+        clientSessionId: meta.clientSessionId,
+        lastActivityMs: meta.lastActivityMs,
+        idleMs: Date.now() - meta.lastActivityMs,
+        reason,
+      });
+    } else {
+      reclaimableControllerByDevice.delete(deviceId);
+
+      console.log("[reclaim] not preserved", {
+        deviceId,
+        viewerId,
+        reason,
+        hasMeta: !!meta,
+        mode: meta?.mode ?? null,
+        hasClientSessionId: !!meta?.clientSessionId,
+        lastActivityMs: meta?.lastActivityMs ?? null,
+      });
+    }
+
+    setController(deviceId, null);
   }
 
   const agent = agents.get(deviceId);
@@ -209,7 +292,6 @@ function detachViewer(deviceId, viewerId, reason = "") {
     }
   }
 }
-
 
 const httpServer = http.createServer((req, res) => {
   if (req.url === "/api/devices") {
@@ -226,9 +308,8 @@ const httpServer = http.createServer((req, res) => {
   res.end("ok");
 });
 
-// Keep signaling/control light—compression adds latency/CPU for tiny frequent messages.
 const wssViewers = new WebSocketServer({ noServer: true, perMessageDeflate: false });
-const wssAgents  = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+const wssAgents = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
 httpServer.on("upgrade", (req, socket, head) => {
   const { url } = req;
@@ -252,14 +333,12 @@ wssViewers.on("connection", (ws, req) => {
   ws.isAlive = true;
   ws.on("pong", () => {
     markAlive(ws);
-    const meta = viewerMeta.get(ws);
-    if (meta) meta.lastSeenMs = Date.now();   // <- key line
+    touchViewerSeenByWs(ws);
   });
 
   let deviceId = null;
   let viewerId = null;
 
-  //Hanlder for updating seen field 
   const touchSeen = () => {
     if (deviceId && viewerId) {
       const prev = viewerMeta.get(ws) || { deviceId, viewerId };
@@ -267,29 +346,23 @@ wssViewers.on("connection", (ws, req) => {
     }
   };
 
-  //Handler for updating viewer user activity 
-  const touchActivity = () => {
-    if (deviceId && viewerId) {
-      const prev = viewerMeta.get(ws) || { deviceId, viewerId };
-      viewerMeta.set(ws, { ...prev, deviceId, viewerId, lastSeenMs: Date.now(), lastActivityMs: Date.now() });
-    }
-  };
-
   ws.on("message", (buf) => {
-
-    if (buf.length > MAX_MSG_BYTES) { 
-      try { 
+    if (buf.length > MAX_MSG_BYTES) {
+      try {
         ws.close(1009, "message too big");
-       } catch {} 
-       return; 
+      } catch { }
+      return;
     }
-    
+
     let msg;
-    try { msg = JSON.parse(buf.toString()); } catch { return; }
+    try {
+      msg = JSON.parse(buf.toString());
+    } catch {
+      return;
+    }
 
     console.log("[/signal] msg", msg.type, "deviceId=", msg.deviceId, "viewerId=", msg.viewerId);
 
-    // App-level heartbeat (recommended). Any traffic also counts as liveness.
     if (msg.type === "heartbeat") {
       if (!deviceId) deviceId = msg.deviceId;
       if (!viewerId) viewerId = msg.viewerId;
@@ -299,32 +372,119 @@ wssViewers.on("connection", (ws, req) => {
 
     if (msg.type === "obs" || msg.type === "obs-ttff") {
       touchSeen();
-      console.log("[obs]", { deviceId: msg.deviceId, viewerId: msg.viewerId, type: msg.type, ttffMs: msg.ttffMs, qos: msg.qos, ice: msg.ice });
+      console.log("[obs]", {
+        deviceId: msg.deviceId,
+        viewerId: msg.viewerId,
+        type: msg.type,
+        ttffMs: msg.ttffMs,
+        qos: msg.qos,
+        ice: msg.ice,
+      });
       return;
     }
 
     if (msg.type === "iam-viewer") {
       deviceId = msg.deviceId;
-      viewerId = msg.viewerId ?? crypto.randomUUID();
-      const requestedViewOnly = !!msg.viewOnly;
-    
+      viewerId = crypto.randomUUID();
+
+      const requestedMode = msg.mode === "watch" ? "watch" : "manual";
+      const clientSessionId = typeof msg.clientSessionId === "string" ? msg.clientSessionId : null;
+      const reclaim = getValidReclaim(deviceId);
+      const currentController = getController(deviceId);
+      const automationRunning = automationRunningByDevice.has(deviceId);
+
+      const reclaimMatches =
+        requestedMode === "manual" &&
+        !!clientSessionId &&
+        !!reclaim &&
+        reclaim.clientSessionId === clientSessionId;
+
+      const reclaimReservedForSomeoneElse =
+        requestedMode === "manual" &&
+        !!reclaim &&
+        (!clientSessionId || reclaim.clientSessionId !== clientSessionId);
+
+      let effectiveMode = "watch";
+
+      if (automationRunning) {
+        effectiveMode = "watch";
+      } else if (currentController) {
+        effectiveMode = "watch";
+      } else if (reclaimMatches) {
+        effectiveMode = "manual";
+      } else if (reclaimReservedForSomeoneElse) {
+        effectiveMode = "watch";
+      } else {
+        effectiveMode = requestedMode === "manual" ? "manual" : "watch";
+      }
+
+      const initialLastActivityMs =
+        effectiveMode === "manual"
+          ? reclaimMatches
+            ? reclaim.lastActivityMs
+            : Date.now()
+          : null;
+
       const m = getViewersMap(deviceId);
       m.set(viewerId, ws);
-    
+
       ws._viewerDetached = false;
-      viewerMeta.set(ws, { deviceId, viewerId, lastSeenMs: Date.now(), lastActivityMs: Date.now() });
-    
-      send(ws, { type: "viewer-id", deviceId, viewerId });
+      viewerMeta.set(ws, {
+        deviceId,
+        viewerId,
+        clientSessionId,
+        mode: effectiveMode,
+        lastSeenMs: Date.now(),
+        lastActivityMs: initialLastActivityMs,
+      });
+
+      const resumeRejected =
+        requestedMode === "manual" &&
+        !!clientSessionId &&
+        !reclaimMatches &&
+        (currentController || reclaimReservedForSomeoneElse || automationRunning);
+
+      const currentStatus = getDeviceStatus(deviceId);
+
+      const now = Date.now();
+
+      const resumedLastActivityMs =
+        effectiveMode === "manual" && reclaimMatches
+          ? reclaim.lastActivityMs
+          : initialLastActivityMs;
+
+      const remainingMs =
+        resumedLastActivityMs && effectiveMode === "manual"
+          ? Math.max(0, SESSION_INACTIVITY_MS - (now - resumedLastActivityMs))
+          : null;
+
+
+          send(ws, {
+            type: "viewer-id",
+            deviceId,
+            viewerId,
+            mode: effectiveMode,
+            deviceStatus: currentStatus,
+            resumeRejected,
+            resumeReason: resumeRejected ? "taken_by_other_user" : null,
+            sessionTimeoutMs: effectiveMode === "manual" ? SESSION_INACTIVITY_MS : null,
+            lastActivityMs: resumedLastActivityMs ?? null,
+            remainingMs,
+            resumedFromPreservedLease: reclaimMatches,
+          });
+
       send(ws, { type: "agent-state", deviceId, online: agents.has(deviceId) });
-    
-      // Server-owned viewer-count (push to agent). Agent can use this to start/stop capture.
       notifyViewerCount(deviceId);
-    
-      // Controller semantics:
-      // - If no controller yet, first viewer becomes controller.
-      // - Otherwise, just send the current controller snapshot to this viewer.
+
       const current = getController(deviceId);
-      if (!current && !requestedViewOnly) {
+
+      if (!current && effectiveMode === "manual" && reclaimMatches) {
+        reclaimableControllerByDevice.delete(deviceId);
+        setController(deviceId, viewerId);
+        const interaction = getInteractionState(deviceId);
+        send(ws, { type: "interaction-state", deviceId, ...interaction });
+      } else if (!current && effectiveMode === "manual" && !reclaimMatches) {
+        reclaimableControllerByDevice.delete(deviceId);
         setController(deviceId, viewerId);
         const interaction = getInteractionState(deviceId);
         send(ws, { type: "interaction-state", deviceId, ...interaction });
@@ -333,23 +493,22 @@ wssViewers.on("connection", (ws, req) => {
         const interaction = getInteractionState(deviceId);
         send(ws, { type: "interaction-state", deviceId, ...interaction });
       }
-    
-      console.log("[viewer] registered", { deviceId, viewerId, viewOnly: requestedViewOnly });
+
+      console.log("[viewer] registered", {
+        deviceId,
+        viewerId,
+        requestedMode,
+        effectiveMode,
+        clientSessionId,
+        reclaimMatches,
+        preservedLastActivityMs: reclaimMatches ? reclaim?.lastActivityMs : null,
+      });
       return;
     }
-      
 
     if (!deviceId) deviceId = msg.deviceId;
 
-    // Distinguish liveness vs user activity (so stats/heartbeats don't keep sessions alive forever)
-    const isUserActivity =
-      msg.type === "pointer" ||
-      msg.type === "key" ||
-      msg.type === "text" ||
-      msg.type === "home";
-
-    if (isUserActivity) touchActivity();
-    else touchSeen();
+    touchSeen();
 
     const agent = agents.get(deviceId);
     if (!agent) {
@@ -365,9 +524,10 @@ wssViewers.on("connection", (ws, req) => {
 
   ws.on("close", () => {
     console.log("[/signal] closed");
-    // If we already detached due to TTL sweep, do nothing.
     if (ws._viewerDetached) return;
-    if (deviceId && viewerId) detachViewer(deviceId, viewerId, "ws-close");
+    if (deviceId && viewerId) {
+      detachViewer(deviceId, viewerId, "ws-close", { preserveReclaim: true });
+    }
   });
 
   ws.on("error", (e) => console.log("[/signal] error", e?.message || e));
@@ -377,18 +537,26 @@ wssAgents.on("connection", (ws, req) => {
   console.log("[/agent] connected from", req.socket.remoteAddress);
 
   ws.isAlive = true;
-  ws.on("pong", () => { //maybe delete 
+  ws.on("pong", () => {
     markAlive(ws);
-    const meta = viewerMeta.get(ws);
-    if (meta) meta.lastSeenMs = Date.now();   // <- key line
   });
 
   let deviceId = null;
 
   ws.on("message", (buf) => {
-    if (buf.length > MAX_MSG_BYTES) { try { ws.close(1009, "message too big"); } catch {} return; }
+    if (buf.length > MAX_MSG_BYTES) {
+      try {
+        ws.close(1009, "message too big");
+      } catch { }
+      return;
+    }
+
     let msg;
-    try { msg = JSON.parse(buf.toString()); } catch { return; }
+    try {
+      msg = JSON.parse(buf.toString());
+    } catch {
+      return;
+    }
 
     console.log("[/agent] msg", msg.type, "deviceId=", msg.deviceId, "viewerId=", msg.viewerId);
 
@@ -398,9 +566,10 @@ wssAgents.on("connection", (ws, req) => {
       console.log("[agent] registered", deviceId);
 
       const m = viewersByDevice.get(deviceId);
-      if (m) for (const vws of m.values()) send(vws, { type: "agent-state", deviceId, online: true });
+      if (m) {
+        for (const vws of m.values()) send(vws, { type: "agent-state", deviceId, online: true });
+      }
 
-      // Server-owned viewer-count snapshot (useful if viewers were already connected)
       notifyViewerCount(deviceId);
       return;
     }
@@ -409,6 +578,24 @@ wssAgents.on("connection", (ws, req) => {
       const d = msg.deviceId ?? deviceId;
       if (!d) return;
       setInteractionState(d, msg.state || "idle", msg.reason ? { reason: msg.reason } : {});
+      return;
+    }
+
+    if (msg.type === "controller-activity") {
+      const d = msg.deviceId ?? deviceId;
+      const vId = msg.viewerId;
+      if (!d || !vId) return;
+
+      const controllerId = getController(d);
+      if (!controllerId || controllerId !== vId) {
+        console.log("[activity] ignored; viewer is not current controller", { deviceId: d, viewerId: vId, controllerId });
+        return;
+      }
+
+      const updated = touchViewerActivityByViewerId(d, vId);
+      if (updated) {
+        console.log("[activity] updated lastActivityMs", { deviceId: d, viewerId: vId });
+      }
       return;
     }
 
@@ -429,7 +616,9 @@ wssAgents.on("connection", (ws, req) => {
     if (deviceId && agents.get(deviceId) === ws) {
       agents.delete(deviceId);
       const m = viewersByDevice.get(deviceId);
-      if (m) for (const vws of m.values()) send(vws, { type: "agent-state", deviceId, online: false });
+      if (m) {
+        for (const vws of m.values()) send(vws, { type: "agent-state", deviceId, online: false });
+      }
     }
   });
 
@@ -442,24 +631,27 @@ httpServer.listen(PORT, "0.0.0.0", () => {
   console.log(`  agent:   ws://<host>:${PORT}/agent`);
 });
 
-// Heartbeat: detect dead sockets (proxies, wifi drops) and clean up without waiting for close
+// Heartbeat: detect dead sockets
 setInterval(() => {
   const sweep = (wss) => {
     for (const ws of wss.clients) {
       if (ws.isAlive === false) {
-        try { ws.terminate(); } catch {}
+        try {
+          ws.terminate();
+        } catch { }
         continue;
       }
       ws.isAlive = false;
-      try { ws.ping(); } catch {}
+      try {
+        ws.ping();
+      } catch { }
     }
   };
   sweep(wssViewers);
   sweep(wssAgents);
 }, HEARTBEAT_MS);
 
-// Viewer liveness sweep (app-level + traffic-based). This catches cases where the WS stays "open"
-// but the tab is effectively gone (suspended/crashed) or intermediate network gear misbehaves.
+// Viewer liveness sweep
 setInterval(() => {
   const now = Date.now();
   for (const [ws, meta] of viewerMeta.entries()) {
@@ -469,41 +661,56 @@ setInterval(() => {
     const { deviceId, viewerId } = meta;
     console.log("[liveness] expiring viewer", { deviceId, viewerId, ageMs: now - meta.lastSeenMs });
 
-    // Proactively detach + notify agent. Also terminate the socket.
-    detachViewer(deviceId, viewerId, "ttl-expired");
-    try { ws.terminate(); } catch {}
+    detachViewer(deviceId, viewerId, "ttl-expired", { preserveReclaim: true });
+    try {
+      ws.terminate();
+    } catch { }
   }
 }, VIEWER_SWEEP_MS);
 
+// Cleanup preserved manual leases whose inactivity window has expired
+setInterval(() => {
+  const now = Date.now();
+  for (const [deviceId, reclaim] of reclaimableControllerByDevice.entries()) {
+    if (!reclaim || isLeaseStillActive(reclaim.lastActivityMs)) continue;
 
-// Session inactivity sweep: release idle controller after 15 minutes (watchers remain)
+    console.log("[reclaim] expired preserved lease", {
+      deviceId,
+      lastActivityMs: reclaim.lastActivityMs,
+      idleMs: now - (reclaim.lastActivityMs || 0),
+    });
+
+    reclaimableControllerByDevice.delete(deviceId);
+  }
+}, 2000);
+
+// Session inactivity sweep
 setInterval(() => {
   const now = Date.now();
 
   for (const [ws, meta] of viewerMeta.entries()) {
     if (!meta?.deviceId || !meta?.viewerId) continue;
+    if (meta.mode !== "manual") continue;
 
     const { deviceId, viewerId } = meta;
-    const lastAct = meta.lastActivityMs ?? meta.lastSeenMs ?? 0;
+    const lastAct = meta.lastActivityMs ?? 0;
     if (!lastAct) continue;
 
-    if (RELEASE_CONTROLLER_ONLY) {
-      const controllerId = getController(deviceId);
-      if (!controllerId || controllerId !== viewerId) continue;
-    }
+    const controllerId = getController(deviceId);
+    if (!controllerId || controllerId !== viewerId) continue;
 
     if (now - lastAct <= SESSION_INACTIVITY_MS) continue;
 
     console.log("[session] releasing due to inactivity", { deviceId, viewerId, idleMs: now - lastAct });
 
-    // Notify the viewer UI before we terminate
     try {
       send(ws, { type: "session-released", deviceId, viewerId, reason: "inactivity" });
-    } catch {}
+    } catch { }
 
-    // Detach will clear controller and notify agent
-    detachViewer(deviceId, viewerId, "inactivity");
+    detachViewer(deviceId, viewerId, "inactivity", { preserveReclaim: false });
 
-    try { ws.terminate(); } catch {}
+    try {
+      ws.terminate();
+    } catch { }
   }
 }, SESSION_SWEEP_MS);

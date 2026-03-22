@@ -5,220 +5,230 @@ import DeviceCatalog from './DeviceCatalog'
 import ScreenIOS from './ScreenIOS'
 import { devices } from '../devices'
 
-//Session data type - every opened device is tracked as a "session"
+type SessionMode = 'manual' | 'watch'
+type SessionConnectionState = 'parked' | 'live'
+
 type Session = {
+  sessionId: string
   deviceId: string
   name: string
   platform: 'ios' | 'android'
-  viewOnly?: boolean
+  mode: SessionMode
   openedAt: number
-  lastActivityAt: number
-  pendingReleaseReason?: string | null
+  connectionState: SessionConnectionState
 }
 
-//Inactivity timer threshold 
-const INACTIVITY_MS = 45 * 1000
+// localStorage keys
+const LS_SESSIONS = 'lab.sessions.v3'
+const LS_ACTIVE = 'lab.activeDeviceId.v3'
+const LS_VIEWMODE = 'lab.viewMode.v3'
 
-//localStorage keys to persist state between reloads 
-const LS_SESSIONS = 'lab.sessions.v1' //array of open sessions 
-const LS_ACTIVE = 'lab.activeDeviceId.v1' //currently focused device tab ID 
-const LS_VIEWMODE = 'lab.viewMode.v1' //whether the UI is showing home or device tab/page
+function createSessionId() {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID()
+  }
+  return `sess_${Date.now()}_${Math.random().toString(36).slice(2)}`
+}
 
 export default function Lab() {
-
-  //State for determining user mode -- whether on device catalog page or a device screen
   const [viewMode, setViewMode] = useState<'catalog' | 'viewer'>(() => {
     const v = localStorage.getItem(LS_VIEWMODE)
-    return (v === 'viewer' || v === 'catalog') ? v : 'catalog'
+    return v === 'viewer' || v === 'catalog' ? v : 'catalog'
   })
 
-  //Updates the storage's viewing mode when the viewing mode changes in UI  
-  useEffect(() => { 
-    localStorage.setItem(LS_VIEWMODE, viewMode) 
+  useEffect(() => {
+    localStorage.setItem(LS_VIEWMODE, viewMode)
   }, [viewMode])
 
-  //The list of active device sessions 
+  /**
+   * Important:
+   * On restore after reload, all sessions come back as PARKED first.
+   * We do not want reload storms that reconnect everything immediately.
+   */
   const [sessions, setSessions] = useState<Session[]>(() => {
     try {
       const raw = localStorage.getItem(LS_SESSIONS)
       const parsed = raw ? JSON.parse(raw) : []
       return Array.isArray(parsed)
-        ? parsed.map((s: any) => ({
-            ...s,
-            viewOnly: !!s?.viewOnly,
-            pendingReleaseReason: s?.pendingReleaseReason ?? null,
-          }))
+        ? parsed
+            .filter((s: any) => s?.deviceId && s?.name && s?.platform && s?.mode)
+            .map((s: any) => ({
+              sessionId: String(s.sessionId || createSessionId()),
+              deviceId: String(s.deviceId),
+              name: String(s.name),
+              platform: s.platform === 'android' ? 'android' : 'ios',
+              mode: s.mode === 'watch' ? 'watch' : 'manual',
+              openedAt: Number(s.openedAt || Date.now()),
+              connectionState: 'parked' as SessionConnectionState,
+            }))
         : []
     } catch {
       return []
     }
   })
 
-   //Updates session state when sessions changes and updates the storage value too 
   const sessionsRef = useRef<Session[]>([])
-  useEffect(() => { 
-    sessionsRef.current = sessions 
+  useEffect(() => {
+    sessionsRef.current = sessions
   }, [sessions])
 
-  useEffect(() => { 
-    localStorage.setItem(LS_SESSIONS, JSON.stringify(sessions)) 
+  useEffect(() => {
+    localStorage.setItem(
+      LS_SESSIONS,
+      JSON.stringify(
+        sessions.map((s) => ({
+          sessionId: s.sessionId,
+          deviceId: s.deviceId,
+          name: s.name,
+          platform: s.platform,
+          mode: s.mode,
+          openedAt: s.openedAt,
+          // intentionally do NOT persist runtime live/parked exactly;
+          // on reload we want restored tabs to come back parked
+        }))
+      )
+    )
   }, [sessions])
 
-
-  //Holds the ID of whichever device tab is currently selected (or null if none)
   const [activeDeviceId, setActiveDeviceId] = useState<string | null>(() => {
     return localStorage.getItem(LS_ACTIVE) || null
   })
 
-  //Updates activeID state when active device ID changes and updates the storage value too 
   useEffect(() => {
-    if (activeDeviceId) { 
-      localStorage.setItem(LS_ACTIVE, activeDeviceId) 
-    }
-    else  {  
-      localStorage.removeItem(LS_ACTIVE)
-     }
+    if (activeDeviceId) localStorage.setItem(LS_ACTIVE, activeDeviceId)
+    else localStorage.removeItem(LS_ACTIVE)
   }, [activeDeviceId])
 
-
-  //Tracks the dialog/pop ups when a session gets released due to inactivity - open status and which device and reasoning
-  const [releasedModal, setReleasedModal] = useState<{ open: boolean; deviceName?: string; reason?: string }>({ open: false })
-  ///Tracks the dialog/pop ups when users want to release a device 
   const [confirmReleaseModal, setConfirmReleaseModal] = useState<{ open: boolean; deviceId?: string; deviceName?: string }>({
     open: false,
   })
 
+  /**
+   * Keep active tab valid when sessions change
+   */
   useEffect(() => {
-
-    //If active device id exists but no session exists with that id -> go back to device catalog page 
-    if (activeDeviceId && !sessions.some(s => s.deviceId === activeDeviceId)) {
+    if (activeDeviceId && !sessions.some((s) => s.deviceId === activeDeviceId)) {
       setActiveDeviceId(null)
       setViewMode('catalog')
     } else if (!activeDeviceId && sessions.length > 0) {
       setActiveDeviceId(sessions[0].deviceId)
     }
-  }, [])
-
+  }, [activeDeviceId, sessions])
 
   /**
-   * Handler when user clicks opens/launches a device
+   * After restore/reload:
+   * only the ACTIVE session should auto-promote from parked -> live.
+   * Already-live sessions during normal runtime stay live.
+   */
+  useEffect(() => {
+    if (!activeDeviceId) return
+    setSessions((prev) =>
+      prev.map((s) =>
+        s.deviceId === activeDeviceId && s.connectionState === 'parked'
+          ? { ...s, connectionState: 'live' }
+          : s
+      )
+    )
+  }, [activeDeviceId])
+
+  /**
+   * DeviceCatalog still calls onOpen(deviceId, viewOnly?).
+   *
+   * viewOnly=false => manual
+   * viewOnly=true  => watch
+   *
+   * For your current static JSON testing:
+   * - available => DeviceCatalog should call onOpen(id, false)
+   * - busy      => DeviceCatalog should call onOpen(id, true)
    */
   const openDevice = useCallback((deviceId: string, viewOnly = false) => {
-
-    //Finds the device that matches the specified device id 
-    const foundDevice = devices.find(device => device.id === deviceId)
-
-    //if no device exists -> exit 
+    const foundDevice = devices.find((device) => device.id === deviceId)
     if (!foundDevice) return
 
-    //Updates sessions 
-    setSessions(prev => {
+    const mode: SessionMode = viewOnly ? 'watch' : 'manual'
 
-      //Checks if a session exists for that device ID 
-      const exists = prev.find(session => session.deviceId === deviceId)
-
-      //If a session already exists, refresh lastActivityAt timestamp to now and clear any pending release reason & return
-      if (exists) {
-        return prev.map(session =>
-          session.deviceId === deviceId
-            ? { ...session, viewOnly: !!session.viewOnly || viewOnly, lastActivityAt: Date.now(), pendingReleaseReason: null }
-            : session
+    setSessions((prev) => {
+      const existing = prev.find((s) => s.deviceId === deviceId)
+      if (existing) {
+        // If the tab already exists, keep the stable sessionId and ensure it's live.
+        return prev.map((s) =>
+          s.deviceId === deviceId
+            ? {
+                ...s,
+                mode,
+                connectionState: 'live',
+              }
+            : s
         )
       }
-      //No session exists for this device ID -> create a new Session
+
       const next: Session = {
+        sessionId: createSessionId(),
         deviceId,
         name: foundDevice.name,
         platform: foundDevice.platform,
-        viewOnly,
+        mode,
         openedAt: Date.now(),
-        lastActivityAt: Date.now(),
-        pendingReleaseReason: null,
+        connectionState: 'live',
       }
       return [next, ...prev]
     })
 
-    //Mark this device as the active tab and switch UI mode into device viewer mode 
     setActiveDeviceId(deviceId)
     setViewMode('viewer')
   }, [])
 
-  /**
-   * Handler for closing a device session 
-   */
   const closeSession = useCallback((deviceId: string) => {
+    setSessions((prev) => prev.filter((s) => s.deviceId !== deviceId))
 
-    //Removes the corresponding session from our active sessions array 
-    setSessions(prev => prev.filter(s => s.deviceId !== deviceId))
-
-    //Updates the active tab if needed 
-    setActiveDeviceId(prevActive => {
+    setActiveDeviceId((prevActive) => {
       if (prevActive !== deviceId) return prevActive
-      const remaining = sessionsRef.current.filter(s => s.deviceId !== deviceId)
+      const remaining = sessionsRef.current.filter((s) => s.deviceId !== deviceId)
       return remaining.length ? remaining[0].deviceId : null
     })
   }, [])
 
   /**
-   * Handler for marking controller interaction activity 
-   * 
-   * Updates the timestamp for lastAcitivtyAt and clears any pendingReleaseReasion
+   * Selecting a tab:
+   * - make it active
+   * - if it was parked, promote it to live
+   * - if already live, it stays connected (no reconnect-on-tab-switch)
    */
-  const markActivity = useCallback((deviceId: string) => {
-    setSessions(prev =>
-      prev.map(s =>
-        s.deviceId === deviceId ? { ...s, lastActivityAt: Date.now(), pendingReleaseReason: null } : s
+  const onSelectTab = useCallback((deviceId: string) => {
+    setActiveDeviceId(deviceId)
+    setViewMode('viewer')
+    setSessions((prev) =>
+      prev.map((s) =>
+        s.deviceId === deviceId && s.connectionState === 'parked'
+          ? { ...s, connectionState: 'live' }
+          : s
       )
     )
   }, [])
 
-
-  /**
-   * Every 10 seconds, it checks sessions for inactivity & updates accordingly 
-   */
-  useEffect(() => {
-
-    const iv = window.setInterval(() => {
-      const now = Date.now()
-
-      setSessions(prev => {
-
-        let changed = false
-
-        //Maps over the current sessions 
-        const next = prev.map((s) => {
-
-          //If session already has pendingReleaseReason, leave it as is  
-          if (s.pendingReleaseReason) return s
-
-          //If it hasn't been idle longer than the threshold, leave it as is 
-          if (now - s.lastActivityAt <= INACTIVITY_MS) return s
-
-          //Exceeds threshold -> update pendingReleaseReason for this device session 
-          changed = true
-          return { ...s, pendingReleaseReason: 'Session released due to inactivity.' }
-        })
-
-        //Returns new array if one session has changed 
-        return changed ? next : prev
-      })
-    }, 10_000)
-
-    return () => window.clearInterval(iv)
-  }, [])
-
-
-  //Handlers for clicking a device sesion tab 
-  const onSelectTab = useCallback((deviceId: string) => {
-    setActiveDeviceId(deviceId)
-    setViewMode('viewer')
-  }, [])
-
   const hasSessions = sessions.length > 0
 
+  const activeSession = useMemo(() => {
+    if (!activeDeviceId) return null
+    return sessions.find((s) => s.deviceId === activeDeviceId) || null
+  }, [activeDeviceId, sessions])
+
+  const liveSessions = useMemo(() => {
+    return sessions.filter((s) => s.connectionState === 'live')
+  }, [sessions])
+
   return (
-    <Box sx={{ height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column', bgcolor: 'var(--bg)', color: 'var(--text)' }}>
-      {/* "My devices" bar */}
+    <Box
+      sx={{
+        height: '100%',
+        minHeight: 0,
+        display: 'flex',
+        flexDirection: 'column',
+        bgcolor: 'var(--bg)',
+        color: 'var(--text)',
+      }}
+    >
+      {/* Top bar */}
       <Box
         sx={{
           display: 'flex',
@@ -230,7 +240,6 @@ export default function Lab() {
           borderBottom: '1px solid var(--border)',
         }}
       >
-        {/* My devices "tab" */}
         <Box
           onClick={() => setViewMode('catalog')}
           role="button"
@@ -251,11 +260,10 @@ export default function Lab() {
           <Typography sx={{ fontWeight: 600, fontSize: 14, opacity: 0.7 }}>({sessions.length})</Typography>
         </Box>
 
-        {/* Session tabs */}
         <Box sx={{ flex: 1, overflowX: 'auto' }}>
           {sessions.length === 0 ? null : (
             <Tabs
-              value={viewMode === 'viewer' ? (activeDeviceId || false) : false}
+              value={viewMode === 'viewer' ? activeDeviceId || false : false}
               onChange={(_, v) => onSelectTab(v)}
               variant="scrollable"
               scrollButtons="auto"
@@ -278,7 +286,7 @@ export default function Lab() {
                 },
               }}
             >
-              {sessions.map(s => (
+              {sessions.map((s) => (
                 <Tab
                   key={s.deviceId}
                   value={s.deviceId}
@@ -287,10 +295,20 @@ export default function Lab() {
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                       <span style={{ opacity: 0.85 }}>{s.platform === 'ios' ? '' : '🤖'}</span>
                       <span>{s.name}</span>
+                      {s.mode === 'watch' && (
+                        <span style={{ opacity: 0.6, fontSize: 12 }}>[watch]</span>
+                      )}
+                      {s.connectionState === 'parked' && (
+                        <span style={{ opacity: 0.5, fontSize: 12 }}>[parked]</span>
+                      )}
                       <span
                         onClick={(e) => {
                           e.stopPropagation()
-                          setConfirmReleaseModal({ open: true, deviceId: s.deviceId, deviceName: s.name })
+                          setConfirmReleaseModal({
+                            open: true,
+                            deviceId: s.deviceId,
+                            deviceName: s.name,
+                          })
                         }}
                         style={{
                           display: 'inline-flex',
@@ -316,7 +334,6 @@ export default function Lab() {
         </Box>
       </Box>
 
-      {/* Main content (KEEP BOTH MOUNTED) */}
       <Box sx={{ flex: 1, minHeight: 0, position: 'relative' }}>
         {/* Catalog layer */}
         <Box
@@ -351,11 +368,12 @@ export default function Lab() {
               <Typography>No active device</Typography>
             </Box>
           ) : (
-            sessions.map(s => {
-              const active = viewMode === 'viewer' && activeDeviceId === s.deviceId
+            liveSessions.map((session) => {
+              const active = viewMode === 'viewer' && activeDeviceId === session.deviceId
+
               return (
                 <Box
-                  key={s.deviceId}
+                  key={session.sessionId}
                   sx={{
                     position: 'absolute',
                     inset: 0,
@@ -367,20 +385,12 @@ export default function Lab() {
                   }}
                 >
                   <ScreenIOS
-                    deviceId={s.deviceId}
+                    deviceId={session.deviceId}
+                    clientSessionId={session.sessionId}
                     isActive={active}
-                    viewOnly={!!s.viewOnly}
-                    pendingReleaseReason={s.pendingReleaseReason}
-                    onActivity={() => markActivity(s.deviceId)}
+                    viewOnly={session.mode === 'watch'}
                     onReleased={(info) => {
-                      closeSession(s.deviceId)
-                      if (!info?.silent) {
-                        setReleasedModal({
-                          open: true,
-                          deviceName: s.name,
-                          reason: info?.reason,
-                        })
-                      }
+                      closeSession(session.deviceId)
                       setViewMode('catalog')
                     }}
                   />
@@ -390,27 +400,7 @@ export default function Lab() {
           )}
         </Box>
       </Box>
-
-      {/* Release message modal */}
-      <Dialog open={releasedModal.open} onClose={() => setReleasedModal({ open: false })}>
-        <DialogTitle>We are sorry…</DialogTitle>
-        <DialogContent>
-          <Typography sx={{ mb: 1 }}>Your device is no longer available.</Typography>
-          <Typography sx={{ color: 'text.secondary' }}>
-            {releasedModal.reason
-              ? releasedModal.reason
-              : releasedModal.deviceName
-              ? `We released ${releasedModal.deviceName}.`
-              : 'This session has been released.'}
-          </Typography>
-        </DialogContent>
-        <DialogActions>
-          <Button variant="contained" onClick={() => setReleasedModal({ open: false })}>
-            OK, take me to my devices page
-          </Button>
-        </DialogActions>
-      </Dialog>
-
+      {/* Manual close/release confirm */}
       <Dialog open={confirmReleaseModal.open} onClose={() => setConfirmReleaseModal({ open: false })}>
         <DialogTitle>Release this device?</DialogTitle>
         <DialogContent>

@@ -7,12 +7,11 @@ import DownloadRoundedIcon from '@mui/icons-material/DownloadRounded'
 import { devices } from '../devices'
 import { APP_LIBRARY } from './appLibrary'
 
-//Builds the WebSocket endpoint for signaling
+// Builds the WebSocket endpoint for signaling
 function computeSignalUrl() {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const host = window.location.hostname 
   const port = 8080
-  return `${proto}//${host}:${port}/signal`
+  return `${proto}//192.168.86.29:${port}/signal`
 }
 const SIGNAL_URL = computeSignalUrl()
 
@@ -36,17 +35,14 @@ const SCREEN_CORNER_RADIUS_FRAC = {
   proMax: 0.085,
 } as const
 
-//Supported App Builds platform
-type ArtifactPlatform = 'ios' | 'android' 
+type ArtifactPlatform = 'ios' | 'android'
 
-//Single downloadable app build 
 type AppArtifact = {
   id: string
-  code: string // build identifier shown in the list (e.g., 26.04.2)
+  code: string
   platform: ArtifactPlatform
 }
 
-//Single app release (26.02), which groups all builds under this release
 type AppRelease = {
   id: string
   label: string
@@ -54,7 +50,6 @@ type AppRelease = {
   artifacts: AppArtifact[]
 }
 
-//Lab App -> AppRelease[] -> AppArtifact[]
 type LabApp = {
   id: string
   name: string
@@ -66,67 +61,43 @@ function clamp(n: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, n))
 }
 
-//Picks the phone bezel based on the device name 
 function pickBezelKind(deviceName: string): keyof typeof BEZELS {
   const n = (deviceName || '').toLowerCase()
   if (n.includes('max')) return 'proMax'
   return 'pro'
 }
 
-/**
- * isActive: tells whether this device screen is currently visible session 
- * onActivity: Callback whenever the user actually interacts with device -> resets its inactivity timer 
- * onReleased: invoked when the session is released 
- * pendingReleaseReasion: Lab can set this when its own inactivity sweep decices to release a session 
- *      * ScreenIOS watches the prop to stop streaming immediately and show pop ups for inactivity 
- */
 type ScreenIOSProps = {
   deviceId?: string
+  clientSessionId: string
   isActive?: boolean
   viewOnly?: boolean
-  onActivity?: () => void
   onReleased?: (info: { reason: string; silent?: boolean }) => void
-  pendingReleaseReason?: string | null
 }
 
-export default function ScreenIOS(props: ScreenIOSProps = {}) {
-
+export default function ScreenIOS(props: ScreenIOSProps) {
   const routeId = useParams<{ deviceId: string }>().deviceId || ''
   const deviceId = props.deviceId || routeId
 
-  // ✅ IMPORTANT: store callbacks in refs so they don't restart the stream on each render
-  const onActivityRef = useRef<ScreenIOSProps['onActivity']>(props.onActivity)
   const onReleasedRef = useRef<ScreenIOSProps['onReleased']>(props.onReleased)
-  useEffect(() => {
-    onActivityRef.current = props.onActivity
-  }, [props.onActivity])
   useEffect(() => {
     onReleasedRef.current = props.onReleased
   }, [props.onReleased])
 
-
   const isActive = props.isActive ?? true
   const isActiveRef = useRef(isActive)
 
-  //Registers user activity via onActivity callback 
-  const registerActivity = useCallback(() => {
-    if (!isActiveRef.current) return
-    onActivityRef.current?.()
-  }, [])
   useEffect(() => {
     isActiveRef.current = isActive
     if (!isActive && plusRef.current) {
       plusRef.current.style.opacity = '0'
     }
-    if (isActive) registerActivity()
-  }, [isActive, registerActivity])
+  }, [isActive])
 
-  //Gets the devices based on device ID 
   const device = useMemo(() => {
     return devices.find((currentDevice) => currentDevice.id === deviceId)
   }, [deviceId])
 
-  // Refs for video, stage, view, etc.
   const videoRef = useRef<HTMLVideoElement>(null)
   const stageRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<HTMLDivElement>(null)
@@ -135,10 +106,20 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
   const plusRef = useRef<HTMLDivElement>(null)
   const plusRafRef = useRef<number | null>(null)
 
+  const setTouchDotPressed = (pressed: boolean) => {
+    const el = plusRef.current
+    if (!el) return
+    el.style.width = pressed ? '18px' : '14px'
+    el.style.height = pressed ? '18px' : '14px'
+    el.style.opacity = '1'
+  }
+
   const [streamReady, setStreamReady] = useState(false)
   const [layoutReady, setLayoutReady] = useState(false)
   const [releaseOverlay, setReleaseOverlay] = useState<string | null>(null)
-  const pendingReleaseReasonRef = useRef<string | null>(null)
+  const releaseReasonRef = useRef<string | null>(null)
+  const releaseActionReasonRef = useRef<string | null>(null)
+
   const [appsExpanded, setAppsExpanded] = useState(false)
   const [selectedAppId, setSelectedAppId] = useState(APP_LIBRARY[0]?.id ?? '')
   const [selectedReleaseId, setSelectedReleaseId] = useState(APP_LIBRARY[0]?.releases[0]?.id ?? '')
@@ -155,38 +136,40 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
     viewerIdRef.current = viewerId
   }, [viewerId])
 
+  const inactivityLastActivityRef = useRef<number | null>(null)
+  const inactivityTimeoutMsRef = useRef<number | null>(null)
+  const inactivityTickRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const [remainingInactivityMs, setRemainingInactivityMs] = useState<number | null>(null)
+
+
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const dcRef = useRef<RTCDataChannel | null>(null)
 
-  /**
-   * Handler that  cleanly shits down the viewer's signaling and webrtc connections 
-   * Calls whenever a session is released - either by the server or the linactivity sweep 
-   */
   const stopStreamingTransport = useCallback(() => {
     intentionalCloseRef.current = true
     if (reconnectTimerRef.current) {
       clearTimeout(reconnectTimerRef.current)
       reconnectTimerRef.current = null
     }
+
     const sock = wsRef.current
     if (sock) {
-     
-        sock.onopen = null
-        sock.onmessage = null
-        sock.onclose = null
-        sock.onerror = null
-        sock.close()
-      
+      sock.onopen = null
+      sock.onmessage = null
+      sock.onclose = null
+      sock.onerror = null
+      sock.close()
       wsRef.current = null
     }
+
     const pc = pcRef.current
     if (pc) {
-        pc.close()
-      }
+      pc.close()
+    }
   }, [])
+
   const startedRef = useRef(false)
 
-  //Controller State & Handling 
   const [controllerId, setControllerId] = useState<string | null>(null)
   const [interactionState, setInteractionState] = useState<'idle' | 'starting' | 'ready' | 'error'>('idle')
 
@@ -195,80 +178,96 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
   const isWarmingControl = canControl && interactionState === 'starting'
   const hasControllerError = canControl && interactionState === 'error'
   const canInteractRef = useRef(false)
+
   useEffect(() => {
     canInteractRef.current = !!canInteract
   }, [canInteract])
-  useEffect(() => {
-    if (canInteract) registerActivity()
-  }, [canInteract, registerActivity])
 
-  // Zoom settings
+  useEffect(() => {
+    if (inactivityTickRef.current) {
+      clearInterval(inactivityTickRef.current)
+      inactivityTickRef.current = null
+    }
+
+    if (!canControl || !inactivityLastActivityRef.current || !inactivityTimeoutMsRef.current) {
+      setRemainingInactivityMs(null)
+      return
+    }
+
+    const tick = () => {
+      const lastActivityMs = inactivityLastActivityRef.current
+      const timeoutMs = inactivityTimeoutMsRef.current
+
+      if (!lastActivityMs || !timeoutMs) {
+        setRemainingInactivityMs(null)
+        return
+      }
+
+      const remaining = Math.max(0, timeoutMs - (Date.now() - lastActivityMs))
+      setRemainingInactivityMs(remaining)
+    }
+
+    tick()
+    inactivityTickRef.current = setInterval(tick, 500)
+
+    return () => {
+      if (inactivityTickRef.current) {
+        clearInterval(inactivityTickRef.current)
+        inactivityTickRef.current = null
+      }
+    }
+  }, [canControl])
+
+
   const ZMIN = 0.25
   const ZMAX = 3.0
+
   const [scale, setScale] = useState<number>(() => parseFloat(localStorage.getItem('emuZoom') || '1') || 1)
   const scaleRef = useRef(scale)
   useEffect(() => {
     scaleRef.current = scale
   }, [scale])
+
   const [fitScale, setFitScale] = useState(1)
   const fitScaleRef = useRef(fitScale)
   useEffect(() => {
     fitScaleRef.current = fitScale
   }, [fitScale])
-  const updateFitScale = useCallback(
-    (value: number) => {
-      const clamped = clamp(value, ZMIN, ZMAX)
-      fitScaleRef.current = clamped
-      setFitScale(clamped)
-    },
-    [ZMIN, ZMAX]
-  )
+
+  const updateFitScale = useCallback((value: number) => {
+    const clamped = clamp(value, ZMIN, ZMAX)
+    fitScaleRef.current = clamped
+    setFitScale(clamped)
+  }, [])
 
   const userZoomedRef = useRef(false)
 
-  //Hnalders closing the inactivity/release overlay 
   const acknowledgeRelease = useCallback(() => {
-
-    //If no overlay -> exit 
     if (!releaseOverlay) return
 
-    //Clears the overlay 
+    const reason =
+      releaseActionReasonRef.current ||
+      releaseReasonRef.current ||
+      'released'
+
+    releaseActionReasonRef.current = null
+    releaseReasonRef.current = null
     setReleaseOverlay(null)
 
-    //Resets the pendingReleaseReason to prevent reshows 
-    const reason = pendingReleaseReasonRef.current || 'released'
-    pendingReleaseReasonRef.current = null
     setTimeout(() => {
       try {
-        onReleasedRef.current?.({ reason, silent: true })
-      } catch {}
+        onReleasedRef.current?.({ reason, silent: false })
+      } catch { }
     }, 0)
   }, [releaseOverlay])
 
-  useEffect(() => {
-    if (!props.pendingReleaseReason) return
-    pendingReleaseReasonRef.current = props.pendingReleaseReason
-    stopStreamingTransport()
-    if (!isActiveRef.current) return
-    if (releaseOverlay) return
-    setReleaseOverlay(props.pendingReleaseReason)
-  }, [props.pendingReleaseReason, releaseOverlay, stopStreamingTransport])
 
-  useEffect(() => {
-    if (!pendingReleaseReasonRef.current) return
-    if (!isActiveRef.current) return
-    if (releaseOverlay) return
-    setReleaseOverlay(pendingReleaseReasonRef.current)
-  }, [isActive, releaseOverlay])
-
-  // Base (locked) VIDEO intrinsic size (screen-only) in pixels.
   const baseSizeRef = useRef<{ w: number; h: number } | null>(null)
   const setBaseSizeOnce = useCallback((w: number, h: number) => {
     if (!w || !h) return
     if (!baseSizeRef.current) baseSizeRef.current = { w, h }
   }, [])
 
-  // Bezel PNG natural size
   const [bezelNatural, setBezelNatural] = useState<{ w: number; h: number } | null>(null)
   const hasBezel = device?.platform === 'ios'
 
@@ -276,7 +275,6 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
   const bezelSrc = BEZELS[bezelKind]
   const insetsFrac = BEZEL_INSETS_FRAC[bezelKind]
 
-  // Load bezel image once to get naturalWidth/Height
   useEffect(() => {
     if (!hasBezel) {
       setBezelNatural(null)
@@ -342,6 +340,7 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
       if (!geom) {
         const base = baseSizeRef.current
         if (!base) return
+
         stage.style.width = Math.round(base.w * newZoom) + 'px'
         stage.style.height = Math.round(base.h * newZoom) + 'px'
 
@@ -383,17 +382,18 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
       const minScale = Math.max(ZMIN, fitScaleRef.current * MIN_RELATIVE_ZOOM)
       const nz = clamp(z, minScale, ZMAX)
       if (reason === 'user') userZoomedRef.current = true
-      if (reason === 'user') registerActivity()
       setScale(nz)
       localStorage.setItem('emuZoom', String(nz))
       applyLayout(nz)
     },
-    [applyLayout, registerActivity]
+    [applyLayout]
   )
+
   const computeFrameRef = useRef(computeFrame)
   const applyLayoutRef = useRef(applyLayout)
   const applyZoomRef = useRef(applyZoom)
   const updateFitScaleRef = useRef(updateFitScale)
+
   useEffect(() => {
     computeFrameRef.current = computeFrame
   }, [computeFrame])
@@ -407,7 +407,6 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
     updateFitScaleRef.current = updateFitScale
   }, [updateFitScale])
 
-  // ✅ Fit: auto-fit to view (device + bezel)
   const fitToWindow = useCallback(() => {
     const view = viewRef.current
     if (!view) return
@@ -434,7 +433,6 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
     if (!device) return
     if (!isActiveRef.current) return
     if (!canInteractRef.current) return
-    registerActivity()
 
     const ws = wsRef.current
     if (!ws) return
@@ -450,9 +448,8 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
     } else if (ws.readyState === WebSocket.OPEN) {
       ws.send(payload)
     }
-  }, [device, registerActivity])
+  }, [device])
 
-  // --- MAIN CONNECT / STREAM SETUP ---
   useEffect(() => {
     if (!device) return
     if (startedRef.current) return
@@ -461,11 +458,14 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
     const video = videoRef.current!
     const stage = stageRef.current!
     const view = viewRef.current!
+
     setStreamReady(false)
     setLayoutReady(false)
     setReleaseOverlay(null)
-    pendingReleaseReasonRef.current = null
+    releaseReasonRef.current = null
     setInteractionState('idle')
+    setViewerId(null)
+    setControllerId(null)
 
     offerSentRef.current = false
     userZoomedRef.current = false
@@ -476,9 +476,12 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
     })
     pcRef.current = pc
 
+    // Add transceiver only once for this PC
+    const tx = pc.addTransceiver('video', { direction: 'recvonly' })
+    preferH264OnTransceiver(pc, tx)
+
     console.log('WS url', SIGNAL_URL)
     let wsAttempt = 0
-
     let disposed = false
     intentionalCloseRef.current = false
     reconnectTimerRef.current = null
@@ -488,9 +491,9 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
       wsRef.current = w
       return w
     }
+
     let ws = makeWs()
 
-    //Handles automatic viewer reconnection when the signaling WS  drops inexpectedly 
     const scheduleReconnect = () => {
       if (disposed || intentionalCloseRef.current) return
       const wait = Math.min(15000, 300 * Math.pow(2, wsAttempt++)) + Math.random() * 250
@@ -503,98 +506,102 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
       }, wait)
     }
 
-    //Wires up the lifecycle events for the viewer's signaling WS 
     const bindWsHandlers = (sock: WebSocket) => {
-
-      //When the socket opens, we send a message to server for viewing! 
       sock.onopen = async () => {
         wsAttempt = 0
-        sock.send(JSON.stringify({ type: 'iam-viewer', deviceId: device.id, viewOnly: !!props.viewOnly }))
-
-        //Adds a video transciever for our PC to recieve video only 
-        const tx = pc.addTransceiver('video', { direction: 'recvonly' })
-        preferH264OnTransceiver(pc, tx)
+        sock.send(
+          JSON.stringify({
+            type: 'iam-viewer',
+            deviceId: device.id,
+            clientSessionId: props.clientSessionId,
+            mode: props.viewOnly ? 'watch' : 'manual',
+            viewOnly: !!props.viewOnly,
+          })
+        )
       }
 
-      //Processes messages over websocket 
       sock.onmessage = async (event) => {
-
-        //Parse the WS message 
         const msg: any = JSON.parse(event.data)
 
-        //Sets the remote SDP/answer when the agent responds to our offer  
         if (msg.type === 'answer' && msg.deviceId === device.id) {
           await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp })
-        } 
-        //Adds ICE candidates to our PC  
-        else if (msg.type === 'ice' && msg.deviceId === device.id && msg.candidate) {
+        } else if (msg.type === 'ice' && msg.deviceId === device.id && msg.candidate) {
           try {
             await pc.addIceCandidate(msg.candidate)
-          } catch {}
-        }
-        else if (msg.type === 'viewer-id' && msg.deviceId === device.id) {
-
-          //Records the assigned viewer ID established from server
+          } catch { }
+        } else if (msg.type === 'viewer-id' && msg.deviceId === device.id) {
           setViewerId(msg.viewerId)
 
-          //Checks if ofer has been sent 
-          if (!offerSentRef.current) {
-
-            //Offer has not be sent -> send one 
-            offerSentRef.current = true
-
-            //Create offer and set it locally 
-            const offer = await pc.createOffer()
-            await pc.setLocalDescription(offer)
-
-            //Send offer to server for agent 
-            sock.send(
-              JSON.stringify({
-                type: 'offer',
-                deviceId: device.id,
-                viewerId: msg.viewerId,
-                sdp: offer.sdp,
-                deviceInfo: {
-                  platform: device.platform,
-                  windowMatch: device.windowMatch,
-                  id: device.id,
-                  name: device.name,
-                },
-              })
-            )
+          if (typeof msg.sessionTimeoutMs === 'number' && msg.sessionTimeoutMs > 0) {
+            inactivityTimeoutMsRef.current = msg.sessionTimeoutMs
           }
+
+          if (typeof msg.lastActivityMs === 'number' && msg.lastActivityMs > 0) {
+            inactivityLastActivityRef.current = msg.lastActivityMs
+
+            if (typeof msg.sessionTimeoutMs === 'number' && msg.sessionTimeoutMs > 0) {
+              const remaining = Math.max(0, msg.sessionTimeoutMs - (Date.now() - msg.lastActivityMs))
+              setRemainingInactivityMs(remaining)
+            }
+          } else {
+            inactivityLastActivityRef.current = null
+            setRemainingInactivityMs(null)
+          }
+
+          if (msg.resumeRejected && msg.resumeReason === 'taken_by_other_user') {
+            releaseActionReasonRef.current = 'resume_failed_taken_by_other_user'
+            releaseReasonRef.current = 'Control could not be resumed because another user took the device'
+            setReleaseOverlay('Control could not be resumed because another user took the device')
+            stopStreamingTransport()
+            return
+          }
+
+
+          if (offerSentRef.current) return
+          offerSentRef.current = true
+
+          const offer = await pc.createOffer()
+          await pc.setLocalDescription(offer)
+
+          sock.send(
+            JSON.stringify({
+              type: 'offer',
+              deviceId: device.id,
+              viewerId: msg.viewerId,
+              sdp: offer.sdp,
+              deviceInfo: {
+                platform: device.platform,
+                windowMatch: device.windowMatch,
+                id: device.id,
+                name: device.name,
+              },
+            })
+          )
         }
-        //Updates controller state to determine whether user can interact 
         else if (msg.type === 'control-state' && msg.deviceId === device.id) {
           setControllerId(msg.controllerId || null)
-        }
-        else if (msg.type === 'interaction-state' && msg.deviceId === device.id) {
+        } else if (msg.type === 'interaction-state' && msg.deviceId === device.id) {
           const nextState =
             msg.state === 'starting' || msg.state === 'ready' || msg.state === 'error'
               ? msg.state
               : 'idle'
           setInteractionState(nextState)
-        }
-         //Updates controller state to determine whether user can interact  
-        else if (msg.type === 'control-denied' && msg.deviceId === device.id) {
+        } else if (msg.type === 'control-denied' && msg.deviceId === device.id) {
           setControllerId(msg.controllerId || null)
-        } 
-        //Server tells us the controller was release (inactivity)
-        //Show overlay & stop streaming 
-        else if (msg.type === 'session-released' && msg.deviceId === device.id) {
+        } else if (msg.type === 'session-released' && msg.deviceId === device.id) {
           const reasonRaw = (msg.reason || '').toString().toLowerCase()
+
           let reasonMessage = 'This session has been released.'
           if (reasonRaw.includes('inactive') || reasonRaw.includes('idle')) {
             reasonMessage = 'Session released due to inactivity.'
-          } 
-          if (canInteractRef.current) {
-            pendingReleaseReasonRef.current = msg.reason || 'released'
-            setReleaseOverlay(reasonMessage)
-          } else {
-            try {
-              onReleasedRef.current?.({ reason: msg.reason || 'released', silent: false })
-            } catch {}
+          } else if (reasonRaw.includes('replaced')) {
+            reasonMessage = 'This device is now being used by someone else.'
           }
+
+          releaseReasonRef.current = reasonMessage
+          setReleaseOverlay(reasonMessage)
+          inactivityLastActivityRef.current = null
+          setRemainingInactivityMs(null)
           stopStreamingTransport()
         }
       }
@@ -602,7 +609,7 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
       sock.onerror = () => {
         try {
           sock.close()
-        } catch {}
+        } catch { }
       }
 
       sock.onclose = () => {
@@ -611,60 +618,48 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
       }
     }
 
-    //Calls the binding method on our newly created Web Socket 
     bindWsHandlers(ws)
 
-    // P2P control channel
     const dc = pc.createDataChannel('control', { ordered: true })
     dcRef.current = dc
     dc.onopen = () => console.log('[dc] open')
     dc.onclose = () => console.log('[dc] close')
     dc.onerror = (e) => console.log('[dc] error', e)
 
-    //Sends interaction events from viewer to agent 
     const sendControl = (obj: any) => {
+      if (canControl && !props.viewOnly && inactivityTimeoutMsRef.current) {
+        const now = Date.now()
+        inactivityLastActivityRef.current = now
+        setRemainingInactivityMs(inactivityTimeoutMsRef.current)
+      }
+
       const s = JSON.stringify(obj)
       if (dc.readyState === 'open') dc.send(s)
       else if (ws.readyState === WebSocket.OPEN) ws.send(s)
     }
 
-    // Stats HUD -> signaling (only when active)
-    const stopHud = () => {}
+
+    const stopHud = () => { }
 
     pc.oniceconnectionstatechange = () => console.log('[viewer] ice=', pc.iceConnectionState)
     pc.onconnectionstatechange = () => console.log('[viewer] conn=', pc.connectionState)
     pc.onicegatheringstatechange = () => console.log('[viewer] gathering=', pc.iceGatheringState)
 
-    //Fires everytime the agent sends us a media tracl
     pc.ontrack = (event) => {
       console.log('[viewer] ontrack streams=', event.streams?.length, 'track=', event.track.kind, event.track.id)
-      
-      //Grabs the stream 
+
       const [stream] = event.streams
       if (!stream) return
 
-      //Attaches the stream to the video element 
       video.srcObject = stream
       video.autoplay = true
       video.playsInline = true
       video.muted = true
-      ;(video as any).disablePictureInPicture = true
+        ; (video as any).disablePictureInPicture = true
 
       video.play().catch((e) => console.warn('video.play() failed:', e))
-
-      // TTFF observer disabled for now
     }
 
-    // const statsInterval = setInterval(async () => {
-    //   if (!isActiveRef.current) return
-    //   try {
-    //     await pc.getStats()
-    //   } catch (e) {
-    //     console.warn('[stats] getStats failed', e)
-    //   }
-    // }, 1000)
-
-    //Fires when PC discovers new ICE Candidate -> forward to server to agent  
     pc.onicecandidate = (event) => {
       if (!event.candidate) return
       const payload: any = {
@@ -678,19 +673,46 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
       }
     }
 
-    // Normalize relative to the screen hole
     const getNorm = (ev: MouseEvent) => {
-      const screenEl = screenClipRef.current || video
-      const rect = screenEl.getBoundingClientRect()
-      const x = (ev.clientX - rect.left) / rect.width
-      const y = (ev.clientY - rect.top) / rect.height
+      const videoEl = videoRef.current
+      const containerEl = screenClipRef.current || videoEl
+      if (!containerEl) return { x: 0, y: 0 }
+
+      const rect = containerEl.getBoundingClientRect()
+
+      let contentLeft = rect.left
+      let contentTop = rect.top
+      let contentWidth = rect.width
+      let contentHeight = rect.height
+
+      if (videoEl && videoEl.videoWidth > 0 && videoEl.videoHeight > 0) {
+        const videoAspect = videoEl.videoWidth / videoEl.videoHeight
+        const boxAspect = rect.width / rect.height
+
+        if (boxAspect > videoAspect) {
+          contentHeight = rect.height
+          contentWidth = rect.height * videoAspect
+          contentLeft = rect.left + (rect.width - contentWidth) / 2
+          contentTop = rect.top
+        } else if (boxAspect < videoAspect) {
+          contentWidth = rect.width
+          contentHeight = rect.width / videoAspect
+          contentLeft = rect.left
+          contentTop = rect.top + (rect.height - contentHeight) / 2
+        }
+      }
+
+      const x = (ev.clientX - contentLeft) / contentWidth
+      const y = (ev.clientY - contentTop) / contentHeight
+
       return { x: clamp(x, 0, 1), y: clamp(y, 0, 1) }
     }
 
     const onDown = (ev: MouseEvent) => {
       if (!isActiveRef.current) return
       if (!canInteractRef.current) return
-      onActivityRef.current?.()
+      setPlusFromMouse(ev, true)
+      setTouchDotPressed(true)
       const { x, y } = getNorm(ev)
       sendControl({ type: 'pointer', deviceId: device.id, kind: 'down', x, y, buttons: ev.buttons | 1 })
     }
@@ -699,7 +721,6 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
       if (!isActiveRef.current) return
       if (!canInteractRef.current) return
       if ((ev.buttons & 1) === 0) return
-      onActivityRef.current?.()
       const { x, y } = getNorm(ev)
       sendControl({ type: 'pointer', deviceId: device.id, kind: 'move', x, y, buttons: ev.buttons | 1 })
     }
@@ -707,12 +728,12 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
     const onUp = (ev: MouseEvent) => {
       if (!isActiveRef.current) return
       if (!canInteractRef.current) return
-      onActivityRef.current?.()
+      setPlusFromMouse(ev, true)
+      setTouchDotPressed(false)
       const { x, y } = getNorm(ev)
       sendControl({ type: 'pointer', deviceId: device.id, kind: 'up', x, y, buttons: 0 })
     }
 
-    // Update the hover pointer outside React so it stays smooth while the stream is live.
     const setPlusFromMouse = (ev: MouseEvent, on: boolean) => {
       const plusEl = plusRef.current
       if (!plusEl) return
@@ -732,21 +753,27 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
 
     const onEnterPlus = (ev: MouseEvent) => {
       if (!isActiveRef.current) return
+      setTouchDotPressed(false)
       setPlusFromMouse(ev, true)
     }
+
     const onLeavePlus = () => {
       if (plusRafRef.current != null) {
         cancelAnimationFrame(plusRafRef.current)
         plusRafRef.current = null
       }
+      setTouchDotPressed(false)
       if (plusRef.current) plusRef.current.style.opacity = '0'
     }
+
     const onMovePlus = (ev: MouseEvent) => {
       if (!isActiveRef.current) return
+      if ((ev.buttons & 1) === 0) {
+        setTouchDotPressed(false)
+      }
       setPlusFromMouse(ev, true)
     }
 
-    // Wheel debounce
     let wheelAccDx = 0
     let wheelAccDy = 0
     let wheelTimer: any = null
@@ -772,7 +799,6 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
     const onWheel = (ev: WheelEvent) => {
       if (!isActiveRef.current) return
       if (!canInteractRef.current) return
-      onActivityRef.current?.()
       ev.preventDefault()
       const now = performance.now()
       if (now < wheelCooldownUntil) return
@@ -793,24 +819,31 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
     screenEl.addEventListener('mousemove', onMovePlus)
     screenEl.addEventListener('wheel', onWheel, { passive: false } as any)
 
-    // keyboard
     const host = view
     host.tabIndex = 0
     const isMod = (e: KeyboardEvent) => e.metaKey || e.ctrlKey
 
+    const onPaste = (e: ClipboardEvent) => {
+      if (!isActiveRef.current) return
+      if (!canInteractRef.current) return
+
+      const text = e.clipboardData?.getData('text') ?? ''
+      if (!text) return
+
+      e.preventDefault()
+
+      sendControl({
+        type: 'text',
+        deviceId: device.id,
+        text,
+      })
+    }
+
     const onKeyDown = async (e: KeyboardEvent) => {
       if (!isActiveRef.current) return
       if (!canInteractRef.current) return
-      onActivityRef.current?.()
 
       if (isMod(e) && (e.key === 'v' || e.key === 'V')) {
-        e.preventDefault()
-        try {
-          const text = await navigator.clipboard.readText()
-          if (text) sendControl({ type: 'text', deviceId: device.id, text })
-        } catch (err) {
-          console.warn('Clipboard read failed (need https or localhost permission):', err)
-        }
         return
       }
 
@@ -842,8 +875,8 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
 
     host.addEventListener('keydown', onKeyDown)
     host.addEventListener('keyup', onKeyUp)
+    host.addEventListener('paste', onPaste)
 
-    // ---------- Auto-fit logic ----------
     let didAutoFit = false
 
     const doAutoFit = (frameW: number, frameH: number) => {
@@ -872,7 +905,6 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
       if (!w || !h) return false
 
       setBaseSizeOnce(w, h)
-
       applyLayoutRef.current(scaleRef.current)
       setLayoutReady(true)
 
@@ -901,9 +933,11 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
     const setIce = (txt: string, cls: 'ok' | 'warn' | 'err' = 'warn') => {
       if (!iceRef.current) return
       iceRef.current.textContent = txt
-      ;(iceRef.current as any).className = `badge ${cls}`
+        ; (iceRef.current as any).className = `badge ${cls}`
     }
+
     setIce('connecting…', 'warn')
+
     const onVideoConnected = () => {
       setIce('connected', 'ok')
       setStreamReady(true)
@@ -912,7 +946,6 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
 
     return () => {
       stopHud?.()
-      //clearInterval(statsInterval)
       if (wheelTimer) clearTimeout(wheelTimer)
 
       window.removeEventListener('resize', onResize)
@@ -930,10 +963,13 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
 
       host.removeEventListener('keydown', onKeyDown)
       host.removeEventListener('keyup', onKeyUp)
+      host.removeEventListener('paste', onPaste)
+
       if (plusRafRef.current != null) {
         cancelAnimationFrame(plusRafRef.current)
         plusRafRef.current = null
       }
+      setTouchDotPressed(false)
       if (plusRef.current) plusRef.current.style.opacity = '0'
 
       disposed = true
@@ -948,22 +984,21 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
         ws.onmessage = null
         ws.onclose = null
         ws.onerror = null
-      } catch {}
+      } catch { }
 
       try {
         ws.close()
-      } catch {}
+      } catch { }
       try {
         pc.close()
-      } catch {}
+      } catch { }
 
       wsRef.current = null
       startedRef.current = false
       offerSentRef.current = false
     }
-  }, [deviceId, device, setBaseSizeOnce, stopStreamingTransport])
+  }, [deviceId, device, props.clientSessionId, props.viewOnly, setBaseSizeOnce, stopStreamingTransport])
 
-  // Re-apply layout whenever bezel loads
   useEffect(() => {
     if (!baseSizeRef.current) return
     applyLayout(scaleRef.current)
@@ -1002,7 +1037,7 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
   }
 
   function startStatsHud() {
-    return () => {}
+    return () => { }
   }
 
   if (!device) {
@@ -1013,7 +1048,6 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
     )
   }
 
-  // ✅ Proportional toolbar sizing: tied to zoom
   const safeFitScale = fitScale || 1
   const relativeZoom = scale / safeFitScale
   const displayZoomPct = Math.round(relativeZoom * 100)
@@ -1060,6 +1094,7 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
     if (!selectedRelease) return []
     return (selectedRelease.artifacts ?? []).filter((artifact) => artifact.platform === targetPlatform)
   }, [selectedRelease, targetPlatform])
+
   useEffect(() => {
     if (!releaseArtifacts.length) {
       setSelectedArtifactId('')
@@ -1067,6 +1102,7 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
     }
     setSelectedArtifactId((prev) => (releaseArtifacts.some((art) => art.id === prev) ? prev : releaseArtifacts[0].id))
   }, [releaseArtifacts])
+
   const artifactsScrollable = releaseArtifacts.length > 5
   const noArtifactsMessage = targetPlatform
     ? `No ${targetPlatform.toUpperCase()} builds available for this release.`
@@ -1149,7 +1185,6 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
           minHeight: 0,
         }}
       >
-        {/* LEFT SIDE */}
         <Box
           ref={viewRef}
           sx={{
@@ -1160,7 +1195,6 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
             outline: 'none',
           }}
         >
-          {/* Wrapper anchors toolbar to stage so it stays docked during zoom */}
           <Box sx={{ position: 'relative', display: 'inline-block' }}>
             <Box
               id="stage"
@@ -1224,19 +1258,30 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
                   top: 0,
                   transform: 'translate3d(0, 0, 0) translate(-50%, -50%)',
                   zIndex: 5,
-                  color: '#00fff7',
-                  fontSize: 30,
-                  fontWeight: 800,
-                  textShadow: '0 0 8px rgba(0,0,0,0.85)',
+                  width: 14,
+                  height: 14,
+                  borderRadius: '50%',
+                  border: '2px solid rgba(0, 255, 247, 0.95)',
+                  boxShadow: '0 0 10px rgba(0, 255, 247, 0.45)',
+                  background: 'rgba(0, 255, 247, 0.10)',
                   pointerEvents: 'none',
                   userSelect: 'none',
-                  lineHeight: 1,
                   opacity: 0,
                   willChange: 'transform, opacity',
+                  '&::after': {
+                    content: '""',
+                    position: 'absolute',
+                    left: '50%',
+                    top: '50%',
+                    width: 6,
+                    height: 6,
+                    borderRadius: '50%',
+                    background: 'rgba(0, 255, 247, 0.98)',
+                    transform: 'translate(-50%, -50%)',
+                    boxShadow: '0 0 6px rgba(0, 255, 247, 0.7)',
+                  },
                 }}
-              >
-                +
-              </Box>
+              />
 
               {isWarmingControl && !releaseOverlay && (
                 <Box
@@ -1262,12 +1307,9 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
                 </Box>
               )}
 
-              {releaseOverlay && (
-                <></>
-              )}
+              {releaseOverlay && <></>}
             </Box>
 
-            {/* ✅ iOS-emulator style rail: only show once stream is live */}
             {streamReady && (
               <Box
                 sx={{
@@ -1310,31 +1352,11 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
                     </IconButton>
                   </span>
                 </Tooltip>
-
-                {/* <Tooltip title="Power" placement="left">
-                  <span>
-                    <IconButton
-                      onClick={sendPower}
-                      disabled
-                      sx={{
-                        width: iconBox,
-                        height: iconBox,
-                        borderRadius: 0,
-                        color: '#94a3b8',
-                        '&:hover': { bgcolor: 'rgba(15,23,42,0.06)', color: '#64748b' },
-                        '&.Mui-disabled': { color: 'rgba(148,163,184,0.55)' },
-                      }}
-                    >
-                      <PowerSettingsNewRoundedIcon sx={{ fontSize: iconSize }} />
-                    </IconButton>
-                  </span>
-                </Tooltip> */}
               </Box>
             )}
           </Box>
         </Box>
 
-        {/* RIGHT PANEL */}
         <Box
           sx={{
             borderLeft: '1px solid var(--border)',
@@ -1344,7 +1366,6 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
             minHeight: 0,
           }}
         >
-          {/* Header */}
           <Box sx={{ px: 2, pt: 2, pb: 1.5, borderBottom: '1px solid var(--border)' }}>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
               <Typography sx={{ fontWeight: 700, fontSize: 16, flex: 1 }}>{device.name}</Typography>
@@ -1375,7 +1396,6 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
               gap: 2,
             }}
           >
-            {/* Interaction status */}
             <Box className={`modeCard ${canControl ? 'interact' : 'viewonly'}`}>
               <span className={`modeDot ${canControl ? 'interact' : 'viewonly'}`} />
               <Box sx={{ flex: 1 }}>
@@ -1403,7 +1423,6 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
               </Box>
             </Box>
 
-            {/* Zoom */}
             <Box>
               <Box sx={{ display: 'flex', alignItems: 'center', mb: 0.5 }}>
                 <Typography sx={{ fontSize: 12, fontWeight: 800, color: 'var(--muted)' }}>Zoom</Typography>
@@ -1445,7 +1464,6 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
 
             <Divider sx={{ borderColor: 'var(--border)', mt: 0.5, mb: 1 }} />
 
-            {/* App installs */}
             {canInteract && (
               <>
                 <Box>
@@ -1458,7 +1476,6 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
                       py: 0.5,
                     }}
                     onClick={() => {
-                      registerActivity()
                       setAppsExpanded((prev) => !prev)
                     }}
                   >
@@ -1485,7 +1502,6 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
                             size="small"
                             value={selectedAppId}
                             onChange={(e) => {
-                              registerActivity()
                               setSelectedAppId(e.target.value)
                             }}
                             sx={{
@@ -1511,7 +1527,6 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
                             value={selectedRelease?.id || ''}
                             disabled={!releaseOptions.length}
                             onChange={(e) => {
-                              registerActivity()
                               setSelectedReleaseId(e.target.value)
                             }}
                             sx={{
@@ -1549,7 +1564,6 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
                               <Box
                                 key={artifact.id}
                                 onClick={() => {
-                                  registerActivity()
                                   setSelectedArtifactId(artifact.id)
                                 }}
                                 sx={{
@@ -1574,7 +1588,6 @@ export default function ScreenIOS(props: ScreenIOSProps = {}) {
                                   sx={{ color: 'var(--text)' }}
                                   onClick={(e) => {
                                     e.stopPropagation()
-                                    registerActivity()
                                     setSelectedArtifactId(artifact.id)
                                   }}
                                 >

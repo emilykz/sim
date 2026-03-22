@@ -33,7 +33,7 @@ final class AgentApp: ObservableObject {
     private var appiumUdid: String? = nil
     private let adb = ADBDriver()
     private var adbSerial: String? = nil
-    private var androidDisplaySize: (width: Double, height: Double)? = nil
+    private var androidInputRect: (left: Double, top: Double, width: Double, height: Double)? = nil
     private var lastPlatformStr: String = "ios"
 
     private enum AppiumLeaseState: Equatable {
@@ -52,6 +52,10 @@ final class AgentApp: ObservableObject {
     // Pointer aggregation (down/move/up -> tap/swipe)
     private var pointerDown: (x: Double, y: Double, t: CFTimeInterval)? = nil
     private var pointerLast: (x: Double, y: Double)? = nil
+
+    private let tapMoveThreshold: Double = 0.02
+    private let longPressMinSeconds: Double = 0.45
+    private let longPressMaxMoveThreshold: Double = 0.02
 
     
     private var isCapturing = false
@@ -278,8 +282,8 @@ final class AgentApp: ObservableObject {
         guard let type = payload["type"] as? String else { return }
 
         // Optional safety: ignore input from non-controller viewers.
-        if let ctrl = currentControllerId, ctrl != viewerId {
-            print("[control] ignored from non-controller viewerId=\(viewerId) type=\(type) currentController=\(ctrl)")
+        guard currentControllerId == viewerId else {
+            print("[control] ignored from non-controller viewerId=\(viewerId) type=\(type) currentController=\(currentControllerId ?? "nil")")
             return
         }
 
@@ -293,6 +297,9 @@ final class AgentApp: ObservableObject {
 
             // iOS simulator: translate down/move/up into a single tap or swipe via Appium.
             // NOTE: x/y are normalized (0..1) within the screen hole (ScreenIOS.tsx getNorm).
+            if kind == "down" {
+                reportControllerActivity(viewerId: viewerId)
+            }
             Task { [weak self] in
                 await self?.handlePointer(kind: kind, xNorm: x, yNorm: y)
             }
@@ -306,6 +313,7 @@ final class AgentApp: ObservableObject {
             // For iOS sims, we send key presses via Appium.
             // We only act on keyDown to avoid double firing.
             if action == "down" {
+                reportControllerActivity(viewerId: viewerId)
                 Task { [weak self] in
                     await self?.handleKey(code: code, key: key)
                 }
@@ -315,11 +323,15 @@ final class AgentApp: ObservableObject {
             let text = payload["text"] as? String ?? ""
             print("[control] text viewerId=\(viewerId) \(text.debugDescription)")
 
+            if !text.isEmpty {
+                reportControllerActivity(viewerId: viewerId)
+            }
             Task { [weak self] in
                 await self?.handleText(text)
             }
         case "home":
             print("[control] home viewerId=\(viewerId)")
+            reportControllerActivity(viewerId: viewerId)
             Task { [weak self] in
                 await self?.handleHome()
             }
@@ -339,7 +351,15 @@ final class AgentApp: ObservableObject {
         }
         signaling?.send(msg)
     }
-
+    
+    private func reportControllerActivity(viewerId: String) {
+        signaling?.send([
+            "type": "controller-activity",
+            "deviceId": deviceId,
+            "viewerId": viewerId
+        ])
+    }
+    
     private func recordAppiumSuccess() {
         appiumConsecutiveFailures = 0
     }
@@ -487,48 +507,72 @@ final class AgentApp: ObservableObject {
             notifyInteractionState("error", reason: "missing-adb-serial")
             return
         }
-
+        
         notifyInteractionState("starting")
         do {
             let size = try await adb.getDisplaySize(serial: serial)
-            androidDisplaySize = (width: Double(size.width), height: Double(size.height))
+            androidInputRect = (
+                left: 0,
+                top: 0,
+                width: Double(size.width),
+                height: Double(size.height)
+            )
+            print("[adb] wm size w=\(size.width) h=\(size.height)")
             notifyInteractionState("ready")
         } catch {
-            print("[adb] failed to resolve display size:", error.localizedDescription)
-            notifyInteractionState("error", reason: error.localizedDescription)
+            print("[adb] wm size failed:", error.localizedDescription)
+            
+            // fallback only if needed
+            do {
+                let rect = try await adb.getInputViewport(serial: serial)
+                androidInputRect = (
+                    left: Double(rect.left),
+                    top: Double(rect.top),
+                    width: Double(rect.width),
+                    height: Double(rect.height)
+                )
+                print("[adb] fallback input viewport left=\(rect.left) top=\(rect.top) w=\(rect.width) h=\(rect.height)")
+                notifyInteractionState("ready")
+            } catch {
+                print("[adb] fallback input viewport also failed:", error.localizedDescription)
+                notifyInteractionState("error", reason: error.localizedDescription)
+            }
         }
     }
 
-
     private func toDeviceXY(xNorm: Double, yNorm: Double) -> (x: Int, y: Int)? {
-        let rect: (width: Double, height: Double)?
+        let rect: (left: Double, top: Double, width: Double, height: Double)?
+
         if platformIsAndroid {
-            rect = androidDisplaySize
+            rect = androidInputRect
+        } else if let r = appiumWindowRect {
+            rect = (left: 0, top: 0, width: r.width, height: r.height)
         } else {
-            rect = appiumWindowRect
+            rect = nil
         }
+
         guard let rect else { return nil }
         guard rect.width.isFinite, rect.height.isFinite,
+              rect.left.isFinite, rect.top.isFinite,
               rect.width > 0, rect.height > 0,
               rect.width <= Double(Int.max), rect.height <= Double(Int.max) else {
-            print("[control] invalid device rect w=\(rect.width) h=\(rect.height); dropping pointer")
+            print("[control] invalid device rect left=\(rect.left) top=\(rect.top) w=\(rect.width) h=\(rect.height); dropping pointer")
             return nil
         }
 
         let safeXNorm = xNorm.isFinite ? max(0, min(1, xNorm)) : 0
         let safeYNorm = yNorm.isFinite ? max(0, min(1, yNorm)) : 0
 
-        let xDouble = safeXNorm * rect.width
-        let yDouble = safeYNorm * rect.height
+        let xDouble = rect.left + (safeXNorm * rect.width)
+        let yDouble = rect.top + (safeYNorm * rect.height)
+
         guard xDouble.isFinite, yDouble.isFinite,
               xDouble <= Double(Int.max), yDouble <= Double(Int.max) else {
             print("[control] invalid pointer conversion x=\(xDouble) y=\(yDouble); dropping pointer")
             return nil
         }
 
-        let x = Int(xDouble)
-        let y = Int(yDouble)
-        return (x, y)
+        return (x: Int(xDouble.rounded()), y: Int(yDouble.rounded()))
     }
 
     private func handlePointer(kind: String, xNorm: Double, yNorm: Double) async {
@@ -536,18 +580,36 @@ final class AgentApp: ObservableObject {
 
         if platformIsAndroid {
             guard let serial = adbSerial, !serial.isEmpty else { return }
-            if androidDisplaySize == nil {
+            if androidInputRect == nil {
                 do {
                     let size = try await adb.getDisplaySize(serial: serial)
-                    androidDisplaySize = (width: Double(size.width), height: Double(size.height))
+                    androidInputRect = (
+                        left: 0,
+                        top: 0,
+                        width: Double(size.width),
+                        height: Double(size.height)
+                    )
+                    print("[adb] pointer wm size w=\(size.width) h=\(size.height)")
                 } catch {
-                    print("[adb] ❌ display size failed:", error.localizedDescription)
-                    return
+                    do {
+                        let rect = try await adb.getInputViewport(serial: serial)
+                        androidInputRect = (
+                            left: Double(rect.left),
+                            top: Double(rect.top),
+                            width: Double(rect.width),
+                            height: Double(rect.height)
+                        )
+                        print("[adb] pointer fallback viewport left=\(rect.left) top=\(rect.top) w=\(rect.width) h=\(rect.height)")
+                    } catch {
+                        print("[adb] ❌ wm size / input viewport failed:", error.localizedDescription)
+                        return
+                    }
                 }
             }
         } else {
             guard let _ = await ensureAppiumSession() else { return }
         }
+
         guard toDeviceXY(xNorm: xNorm, yNorm: yNorm) != nil else {
             print("[control] ⚠️ no device rect yet; dropping pointer")
             return
@@ -571,12 +633,38 @@ final class AgentApp: ObservableObject {
 
             let dx = end.x - down.x
             let dy = end.y - down.y
-            let dist = sqrt(dx*dx + dy*dy)
+            let dist = sqrt(dx * dx + dy * dy)
+            let heldSeconds = max(0, now - down.t)
+            let heldMs = Int(heldSeconds * 1000)
 
-            let TAP_THRESH = 0.02
+            let isStationaryEnoughForTapLike = dist <= tapMoveThreshold
+            let isLongPress = heldSeconds >= longPressMinSeconds && dist <= longPressMaxMoveThreshold
 
-            if dist <= TAP_THRESH {
+            if isLongPress {
                 guard let xy = toDeviceXY(xNorm: end.x, yNorm: end.y) else { return }
+
+                if platformIsAndroid {
+                    guard let serial = adbSerial else { return }
+                    do {
+                        try await adb.longPress(serial: serial, x: xy.x, y: xy.y, durationMs: heldMs)
+                        print("[adb] longPress x=\(xy.x) y=\(xy.y) ms=\(heldMs)")
+                    } catch {
+                        print("[adb] ❌ longPress failed:", error.localizedDescription)
+                    }
+                } else {
+                    guard let sid = appiumSessionId else { return }
+                    do {
+                        try await appium.longPress(sessionId: sid, x: xy.x, y: xy.y, durationMs: heldMs)
+                        recordAppiumSuccess()
+                        print("[appium] longPress x=\(xy.x) y=\(xy.y) ms=\(heldMs)")
+                    } catch {
+                        print("[appium] ❌ longPress failed:", error.localizedDescription)
+                        await recordAppiumFailure("longPress")
+                    }
+                }
+            } else if isStationaryEnoughForTapLike {
+                guard let xy = toDeviceXY(xNorm: end.x, yNorm: end.y) else { return }
+
                 if platformIsAndroid {
                     guard let serial = adbSerial else { return }
                     do {
@@ -600,13 +688,19 @@ final class AgentApp: ObservableObject {
                 guard let startXY = toDeviceXY(xNorm: down.x, yNorm: down.y),
                       let endXY = toDeviceXY(xNorm: end.x, yNorm: end.y) else { return }
 
-                let dt = max(0.08, min(0.8, now - down.t))
-                let ms = Int(dt * 1000)
+                let ms = Int(max(80, min(800, heldSeconds * 1000)))
 
                 if platformIsAndroid {
                     guard let serial = adbSerial else { return }
                     do {
-                        try await adb.swipe(serial: serial, x1: startXY.x, y1: startXY.y, x2: endXY.x, y2: endXY.y, durationMs: ms)
+                        try await adb.swipe(
+                            serial: serial,
+                            x1: startXY.x,
+                            y1: startXY.y,
+                            x2: endXY.x,
+                            y2: endXY.y,
+                            durationMs: ms
+                        )
                         print("[adb] swipe (\(startXY.x),\(startXY.y)) -> (\(endXY.x),\(endXY.y)) ms=\(ms)")
                     } catch {
                         print("[adb] ❌ swipe failed:", error.localizedDescription)
@@ -614,7 +708,14 @@ final class AgentApp: ObservableObject {
                 } else {
                     guard let sid = appiumSessionId else { return }
                     do {
-                        try await appium.swipe(sessionId: sid, x1: startXY.x, y1: startXY.y, x2: endXY.x, y2: endXY.y, durationMs: ms)
+                        try await appium.swipe(
+                            sessionId: sid,
+                            x1: startXY.x,
+                            y1: startXY.y,
+                            x2: endXY.x,
+                            y2: endXY.y,
+                            durationMs: ms
+                        )
                         recordAppiumSuccess()
                         print("[appium] swipe (\(startXY.x),\(startXY.y)) -> (\(endXY.x),\(endXY.y)) ms=\(ms)")
                     } catch {
@@ -864,6 +965,16 @@ final class AppiumDriver {
             ["type": "pointerUp", "button": 0],
         ])
     }
+    
+    func longPress(sessionId: String, x: Int, y: Int, durationMs: Int) async throws {
+        let dur = max(450, min(3000, durationMs))
+        try await performPointer(sessionId: sessionId, steps: [
+            ["type": "pointerMove", "duration": 0, "x": x, "y": y],
+            ["type": "pointerDown", "button": 0],
+            ["type": "pause", "duration": dur],
+            ["type": "pointerUp", "button": 0],
+        ])
+    }
 
     func sendKeys(sessionId: String, text: String) async throws {
         let url = baseUrl
@@ -1001,6 +1112,14 @@ final class ADBDriver {
         let width: Int
         let height: Int
     }
+    
+    struct InputViewport {
+        let left: Int
+        let top: Int
+        let width: Int
+        let height: Int
+    }
+    
 
     enum ADBError: Error, LocalizedError {
         case adbNotFound
@@ -1017,6 +1136,57 @@ final class ADBDriver {
                 return message
             }
         }
+    }
+    
+   
+    func getInputViewport(serial: String) async throws -> InputViewport {
+        print("getting input viewport")
+        let output = try await run(
+            serial: serial,
+            args: ["shell", "sh", "-c", "dumpsys input | grep -m 1 logicalFrame"]
+        )
+
+        print("[adb] filtered dumpsys input:", output)
+
+        if let rect = parseLogicalFrameRect(output) {
+            return rect
+        }
+
+        throw ADBError.badResponse("missing logicalFrame in filtered dumpsys input output: \(output)")
+    }
+    private func parseLogicalFrameRect(_ text: String) -> InputViewport? {
+        let ns = text as NSString
+
+        let patterns = [
+            #"logicalFrame=\[(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\]"#,
+            #"logicalFrame=Rect\((\d+),\s*(\d+)\s*-\s*(\d+),\s*(\d+)\)"#
+        ]
+
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { continue }
+            let range = NSRange(location: 0, length: ns.length)
+            if let match = regex.firstMatch(in: text, options: [], range: range),
+               match.numberOfRanges == 5 {
+                let values: [Int] = (1..<5).compactMap { idx in
+                    let r = match.range(at: idx)
+                    guard r.location != NSNotFound else { return nil }
+                    return Int(ns.substring(with: r))
+                }
+                if values.count == 4 {
+                    let left = values[0]
+                    let top = values[1]
+                    let right = values[2]
+                    let bottom = values[3]
+                    let width = right - left
+                    let height = bottom - top
+                    if width > 0 && height > 0 {
+                        return InputViewport(left: left, top: top, width: width, height: height)
+                    }
+                }
+            }
+        }
+
+        return nil
     }
 
     func getDisplaySize(serial: String) async throws -> DisplaySize {
@@ -1040,6 +1210,15 @@ final class ADBDriver {
             String(x1), String(y1), String(x2), String(y2), String(max(50, durationMs))
         ])
     }
+    
+    func longPress(serial: String, x: Int, y: Int, durationMs: Int) async throws {
+        let dur = max(450, min(3000, durationMs))
+        _ = try await run(serial: serial, args: [
+            "shell", "input", "swipe",
+            String(x), String(y), String(x), String(y), String(dur)
+        ])
+    }
+    
 
     func sendText(serial: String, text: String) async throws {
         let escaped = escapeText(text)
@@ -1252,7 +1431,7 @@ struct DeviceRowView: View {
 
 struct ContentView: View {
     // Signaling host:port for THIS Mac
-    private let hostPort = "192.168.86.28:8080" // adjust if needed
+    private let hostPort = "192.168.86.29:8080" // adjust if needed
 
     // ⚠️ IMPORTANT:
     // These deviceIds MUST match what your web client / server uses
